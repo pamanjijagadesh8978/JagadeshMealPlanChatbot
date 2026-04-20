@@ -10,11 +10,6 @@ DYNAMIC_USERNAME = os.getenv("DYNAMIC_USERNAME")
 DYNAMIC_PASSWORD = os.getenv("DYNAMIC_PASSWORD")
 MASTER_TABLE_DB_NAME = os.getenv("MASTER_TABLE_DB_NAME")
 
-SERVER = '107.20.241.235'
-DYNAMIC_USERNAME = 'CCMTesting'
-DYNAMIC_PASSWORD = 'hme%@nk*^og!#&'
-DYNAMIC_DB_NAME = "FriskaAiCCM_HFWL"
-
 def create_connection(database_name: str):
     conn_str = (
         "DRIVER={ODBC Driver 18 for SQL Server};"
