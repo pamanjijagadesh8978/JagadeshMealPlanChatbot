@@ -14,8 +14,7 @@ import logging
 from langchain_mistralai import ChatMistralAI
 from langchain_core.messages import HumanMessage
 import os
-from dotenv import load_dotenv
-load_dotenv()
+
 # ── Singleton embedding model (loaded once at import time) ──────────────────
 _model = SentenceTransformer("all-MiniLM-L6-v2")
 
