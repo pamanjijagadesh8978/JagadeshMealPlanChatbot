@@ -1,9 +1,6 @@
 import pyodbc
 import os
 import asyncio
-from dotenv import load_dotenv
-
-load_dotenv()
 
 SERVER = os.getenv("SERVER")
 DYNAMIC_USERNAME = os.getenv("DYNAMIC_USERNAME")
