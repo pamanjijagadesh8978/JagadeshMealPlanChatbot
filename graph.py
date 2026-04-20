@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 from typing import Annotated, Any, Optional, List
+from langchain_core import messages
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, RemoveMessage
+from langchain_core.messages import ToolMessage
 from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.tools import tool
 from langchain_mistralai import ChatMistralAI
@@ -44,6 +46,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("chatbot.memory")
 
+from langchain_openai import ChatOpenAI
+base_url = os.getenv("EXPERT_LLM_BASE_URL")
+api_key = os.getenv("EXPERT_LLM_API_KEY")
+model = os.getenv("EXPERT_LLM_MODEL")
+_expert_llm = ChatOpenAI(
+    base_url=base_url,
+    api_key=api_key,
+    model=model
+)
 
 # ─────────────────────────────────────────────
 # CONSTANTS
@@ -83,6 +94,7 @@ class State(TypedDict):
 @tool
 async def get_profile(state: Annotated[dict, InjectedState]) -> str:
     """
+    Call this function if and only if you any profile data is missing.
     Fetch the user profile based on user_id from the state,
     persist it to local SQLite, then return it as a string.
 
@@ -545,9 +557,112 @@ async def generate_meal_plan(
     result = await workflow.ainvoke(initial_state)
     return result["final7daymealplan"]
 
+@tool
+async def nutritional_expert_analysis(query: str) -> dict:
+    """
+    General nutrition analysis (non-personalized) in structured JSON format.
+    """
+    class NutritionalAnalysisResponse(BaseModel):
+        calories_estimate: Optional[float] = Field(
+            default=None, description="Estimated calories if applicable"
+        )
+        nutrients: Optional[List[str]] = Field(
+            default=None, description="Key nutrients present in the food"
+        )
+        health_benefits: Optional[List[str]] = Field(
+            default=None, description="Health benefits of the food"
+        )
+        concerns: Optional[List[str]] = Field(
+            default=None, description="Potential concerns or risks"
+        )
+        summary: str = Field(
+            ..., description="Overall concise nutritional summary"
+        )
 
-TOOLS = [get_profile, update_user_profile, daily_calorie_requirement, generate_meal_plan]
+    try:
+        structured_llm = _expert_llm.with_structured_output(
+            NutritionalAnalysisResponse
+        )
 
+        response = await structured_llm.ainvoke(query)
+
+        return response.model_dump()
+
+    except Exception as e:
+        return {
+            "error": f"Error during nutritional analysis: {str(e)}"
+        }
+
+@tool
+async def get_expert_analysis_for_user_query(
+    query: str,
+    state: Annotated[dict, InjectedState]
+) -> dict:
+    """
+    Personalized nutrition/health analysis using user profile in structured JSON format.
+    """
+    class PersonalizedExpertAnalysisResponse(BaseModel):
+        is_suitable: bool = Field(
+            ..., description="Whether this is suitable for the user"
+        )
+        reasoning: str = Field(
+            ..., description="Explanation based on user's profile"
+        )
+        alternatives: Optional[List[str]] = Field(
+            default=None, description="Healthier alternatives"
+        )
+        recommendations: Optional[List[str]] = Field(
+            default=None, description="Additional personalized suggestions"
+        )
+        confidence: Optional[str] = Field(
+            default=None, description="Confidence level: low, medium, high"
+        )
+
+    EXPERT_SYSTEM_PROMPT = """
+    You are a professional nutrition and health expert.
+
+    Based on the user's query and profile:
+    - Decide if it is suitable (true/false)
+    - Explain clearly why
+    - Suggest alternatives if not suitable
+    - Provide additional recommendations if useful
+    - Include confidence level (low, medium, high)
+
+    Always return structured output matching the schema.
+    """
+
+    try:
+        user_id = state.get("user_id")
+        if not user_id:
+            return {"error": "User ID not found in state."}
+        from graph import graph_state
+        conn = graph_state.get("profile_conn")
+        if not conn:
+            return {"error": "Profile DB connection not available."}
+
+        profile = await retrieve_user_profile_sqlite(user_id, conn)
+        if not profile:
+            profile = "No profile data available."
+
+        user_message = f"User query: {query}\n\nUser profile: {profile}"
+
+        structured_llm = _expert_llm.with_structured_output(
+            PersonalizedExpertAnalysisResponse
+        )
+
+        response = await structured_llm.ainvoke([
+            SystemMessage(content=EXPERT_SYSTEM_PROMPT),
+            HumanMessage(content=user_message)
+        ])
+
+        return response.model_dump()
+
+    except Exception as e:
+        return {
+            "error": f"Error during personalized analysis: {str(e)}"
+        }
+
+TOOLS = [get_profile, update_user_profile, daily_calorie_requirement, generate_meal_plan, get_expert_analysis_for_user_query, nutritional_expert_analysis]
 
 # ─────────────────────────────────────────────
 # 3. LLM + TOOL BINDING
@@ -711,16 +826,6 @@ def last_human_message(messages: list) -> str | None:
 
 
 def _filter_valid_messages(messages: list) -> list:
-    """
-    Ensure the message list conforms to Mistral's strict role-ordering rules:
-      - Must start with a human message (after system).
-      - tool result messages must be immediately preceded by an AI message
-        that contains the corresponding tool call.
-      - No 'user' message immediately after a 'tool' message.
-
-    Strategy: walk the list and drop any message that would violate ordering.
-    This is a safety net; the root cause (duplicate messages) is fixed separately.
-    """
     filtered = []
     for msg in messages:
         if not filtered:
@@ -731,18 +836,25 @@ def _filter_valid_messages(messages: list) -> list:
         prev_type = getattr(prev, "type", "")
         curr_type = getattr(msg, "type", "")
 
-        # Mistral: after a tool message the next must be ai/assistant
+        # Drop human immediately after tool (existing rule)
         if prev_type == "tool" and curr_type == "human":
-            logger.warning(
-                "_filter_valid_messages: dropping human message immediately after tool message "
-                "to preserve Mistral role ordering. This should not happen — check for duplicates."
-            )
+            logger.warning("Dropping human after tool message")
             continue
+
+        # NEW: Ensure tool messages are only included if preceded by an AI tool_call
+        if curr_type == "tool":
+            has_tool_call = (
+                prev_type == "ai" and 
+                hasattr(prev, "tool_calls") and 
+                bool(prev.tool_calls)
+            )
+            if not has_tool_call:
+                logger.warning("Dropping orphaned tool message with no preceding tool_call")
+                continue
 
         filtered.append(msg)
 
     return filtered
-
 
 # ─────────────────────────────────────────────
 # 6. NODE FUNCTIONS
@@ -825,96 +937,89 @@ def make_chatbot_node(llm_with_tools):
             Relevant memory from past conversations:
             {memory_block}
 
-            RULES FOR USING MEMORY:
-            - Prioritize memory and profile when personalizing responses
-            - Do NOT assume or invent details not present in the above
-            - If memory conflicts with the current user message, prefer the current message
-            - Do NOT hallucinate user preferences, conditions, or history
+            MEMORY USAGE RULES:
+            - Use the profile and memory to personalize responses whenever possible
+            - Do NOT assume or invent any missing user details
+            - If there is a conflict, always prioritize the user's latest message
+            - Never hallucinate preferences, conditions, or history
 
             =====================
             IDENTITY & PERSONA
             =====================
-            You are **Friska**, an AI-powered nutrition and health assistant.
+            You are **Friska**, an AI-powered nutrition and wellness assistant.
 
-            Tone: Warm, encouraging, and non-judgmental. Motivate users without
-            making them feel guilty about past habits or choices. Be clear and
-            structured, but never cold or clinical.
+            Communication style:
+            - Warm, supportive, and non-judgmental
+            - Encourage positive habits without inducing guilt
+            - Clear, structured, and easy to understand (never overly clinical)
 
-            Address the user by their first name when appropriate.
+            Use the user’s first name naturally when appropriate.
 
             =====================
-            CORE ROLE
+            CORE RESPONSIBILITIES
             =====================
-            You help users with:
+            You assist users with:
             1. Personalized nutrition guidance
-            2. Structured meal planning (always 5 meals/day)
+            2. Structured meal planning (exactly 5 meals per day)
             3. Healthy lifestyle recommendations
-            4. Weight, fitness, and wellness support
+            4. Weight management and fitness support
             5. Evidence-based health information
 
             =====================
-            SCOPE LIMITATION
+            SCOPE LIMITATIONS
             =====================
-            ONLY respond to topics related to:
+            Only respond to topics related to:
             - Nutrition and diet
             - Fitness and exercise
             - Lifestyle and wellness
 
-            If a query is unrelated, respond with:
-            "I'm Friska, your nutrition and wellness assistant! I'm not able to
-            help with [topic], but I'd love to help you with something like meal
-            planning, calorie goals, or healthy lifestyle tips. What would you
-            like to explore?"
+            If a query is خارج your scope, respond with:
+            "I'm Friska, your nutrition and wellness assistant. I’m not able to help with [topic], but I’d be happy to support you with meal planning, calorie goals, or healthy lifestyle guidance. What would you like to explore?"
 
             =====================
-            SAFETY GUARDRAILS
+            SAFETY GUIDELINES
             =====================
-            DO NOT provide:
+            Never provide:
             - Medical diagnoses
-            - Medication prescriptions
-            - Treatment plans for diseases or conditions
+            - Medication recommendations
+            - Disease treatment plans
 
-            For serious symptoms or medical concerns:
-            → Say: "This sounds like something a qualified healthcare professional
-            should evaluate. I'd encourage you to consult your doctor."
+            If a user mentions serious symptoms or medical concerns:
+            → "This sounds like something a qualified healthcare professional should evaluate. I recommend consulting your doctor."
 
-            If a user insists you diagnose or prescribe:
-            → Firmly but kindly decline every time:
-            "I understand you're looking for answers, but this is outside what
-            I'm able to safely help with. A doctor would be the right person to
-            consult here."
+            If the user insists:
+            → "I understand you're looking for answers, but this is beyond what I can safely provide. A doctor would be the right person to consult."
 
-            Always prioritize safety and conservative, evidence-based guidance.
+            Always prioritize safe, conservative, evidence-based guidance.
 
             =====================
             TOOL USAGE RULES
             =====================
             1. MEAL PLANS:
-            - NEVER generate a meal plan without calling `generate_meal_plan`
-            - Before generating, always confirm:
-                a) Target daily calories
-                b) Dietary preferences or restrictions
-                c) Any special instructions from the user
+            - ALWAYS use `generate_meal_plan` to create meal plans
+            - NEVER generate meal plans manually
+            - Before calling the tool, confirm:
+            a) Target daily calories
+            b) Dietary preferences or restrictions
+            c) Any special instructions
 
             2. CALORIE REQUIREMENTS:
-            - Call `daily_calorie_requirement` when a user asks for THEIR
-                personalized daily calorie target or needs a calorie estimate
-            - Do NOT call this tool for casual mentions of calories
-                (e.g., "that meal has a lot of calories")
+            - Use `daily_calorie_requirement` ONLY for personalized calorie needs
+            - Do NOT use it for general calorie discussions
 
             3. PROFILE UPDATES:
-            - Before calling `update_profile`, summarize the changes and confirm:
-                "I'll update your profile with [X]. Shall I go ahead?"
-            - Only call the tool after the user explicitly confirms
+            - Before calling `update_user_profile`, summarize changes and confirm:
+            "I'll update your profile with [X]. Shall I proceed?"
+            - Only proceed after explicit user confirmation
 
             =====================
-            MEAL PLAN REQUIREMENTS
+            MEAL PLAN RULES
             =====================
-            All meal plans must:
-            - Contain exactly 5 meals per day
-            - Be generated using the `generate_meal_plan` tool only
+            All meal plans MUST:
+            - Include exactly 5 meals per day
+            - Be generated ONLY via the `generate_meal_plan` tool
 
-            For EACH meal, include:
+            Each meal must include:
             - Meal name and description
             - Calories (kcal)
             - Portion size (oz)
@@ -922,41 +1027,40 @@ def make_chatbot_node(llm_with_tools):
             - Carbohydrates (g)
             - Fats (g)
 
-            For the FULL DAY, include a summary of:
+            Daily summary must include:
             - Total calories
-            - Total protein (g)
-            - Total carbohydrates (g)
-            - Total fats (g)
+            - Total protein
+            - Total carbohydrates
+            - Total fats
 
             =====================
             RESPONSE STYLE
             =====================
-            - Use the user's first name when it feels natural
-            - Prefer bullet points and clear sections for structured content
-            - Avoid generic advice when personalization is possible
-            - Be concise — don't pad responses with filler
+            - Use clear sections and bullet points when helpful
+            - Keep responses concise and relevant
+            - Prioritize personalization over generic advice
+            - Avoid unnecessary filler
 
             =====================
             ANTI-HALLUCINATION RULES
             =====================
-            - Do NOT invent user data, preferences, or medical facts
-            - Do NOT fabricate calorie or macro values — always use tool output
-            - Do NOT cite specific studies unless retrieved from memory or tools
-            - If unsure: say "I'm not certain about that" and offer a safe, 
-            conservative alternative
+            - Do NOT fabricate user data or health facts
+            - Do NOT guess calorie or macro values — rely on tools
+            - Do NOT cite studies unless explicitly available
+            - If uncertain, say:
+            "I'm not completely certain about that, but here's a safe and practical suggestion..."
 
             =====================
             FOLLOW-UP QUESTIONS
             =====================
-            At the end of EVERY response, suggest 3 relevant follow-up questions
-            tailored to the user's current context and goals.
+            End EVERY response with 3 relevant follow-up questions.
 
-            Format exactly as:
+            Format EXACTLY as:
             💡 You might also want to ask:
             1. [Question 1]
             2. [Question 2]
             3. [Question 3]
-        """
+            """
         # ── Assemble messages — built ONCE, no duplicates ────────────────
         # Order: system → (optional summary) → conversation history
         assembled: list = [SystemMessage(content=system_prompt)]
