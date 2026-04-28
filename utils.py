@@ -14,7 +14,8 @@ import logging
 from langchain_mistralai import ChatMistralAI
 from langchain_core.messages import HumanMessage
 import os
-
+from dotenv import load_dotenv
+load_dotenv()
 # ── Singleton embedding model (loaded once at import time) ──────────────────
 _model = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -174,11 +175,11 @@ async def retrieve_all_memories(
     async with aiosqlite.connect(DB_PATH) as db:
         return await _fetch(db)
     
-async def retrive_user_profile_sql_lite(
+async def retrieve_user_profile_sql_lite(
         user_id: str,
         conn: Optional[aiosqlite.Connection] = None
 ) -> list[str]:
-    print(f"retrive_user_profile_sql_lite is called")
+    print(f"retrieve_user_profile_sql_lite is called")
     async def _fetch(db: aiosqlite.Connection) -> list[str]:
         cursor = await db.execute(
             "SELECT * FROM UserHealthProfile WHERE user_id = ?",
@@ -278,17 +279,37 @@ def clean_profile(profile: dict, user_id: str) -> dict:
         "goals":                      join_list(profile.get("goals")),
     }
 
+async def fetch_user_id_sql_lite(
+    token: str,
+    conn: Optional[aiosqlite.Connection] = None
+) -> str | None:                              # ← changed return type
+    async def _fetch(db: aiosqlite.Connection) -> str | None:
+        cursor = await db.execute(
+            "SELECT user_id FROM users WHERE api_token = ?", (token,)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row[0] if row else None        # ← return scalar, not list
+
+    if conn is not None:
+        return await _fetch(conn)
+    async with aiosqlite.connect(DB_PATH) as db:
+        return await _fetch(db)
 
 def fetch_user_id(conn, token: str):
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT UserId
-        FROM UserDeviceToken
-        WHERE DeviceToken = ?
-    """, (token,))
-    
-    row = cursor.fetchone()
-    return str(row[0]) if row else None
+    try:
+        cursor.execute("""
+            SELECT TOP 1 UserId
+            FROM UserDeviceToken
+            WHERE DeviceToken = ?
+        """, (token,))
+        
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    finally:
+        cursor.close()
 
 async def get_user_id_sql_server(token: str):
     conn = await get_db_connection_dynamic(DYNAMIC_DB_NAME)
@@ -622,6 +643,7 @@ class MealSchema(BaseModel):
 
 class MealPlanSchema(BaseModel):
     title: str = Field(description="Short title including total calories")
+    meal_date: str = Field(description="Date of the meal plan in DD-MM-YYYY format")
     total_day_macros: MacroSchema = Field(description="Total macros for the entire day")
     breakfast: MealSchema
     morning_snack: MealSchema
@@ -681,9 +703,6 @@ class ParallelSevenDayMealPlans(TypedDict):
     day7meal: str
     final7daymealplan: dict
 
-# from pydantic import BaseModel
-# from langchain_core.messages import HumanMessage
-
 class MealPlanInstructions(BaseModel):
     Day1Instructions: str
     Day2Instructions: str
@@ -697,6 +716,7 @@ async def MealPlanInstructor(
     user_id: str,
     conn: aiosqlite.Connection,
     profile: dict,
+    meal_start_date: Optional[str] = None,
     lock: Optional[asyncio.Lock] = None,
 ) -> MealPlanInstructions:
 
@@ -713,11 +733,17 @@ async def MealPlanInstructor(
     print(f"Eating Sentiment: {eating_sentiments}")
 
     prompt = f"""
-        You are an expert meal planning advisor. Your job is to generate precise, 
+        You are an expert meal planning advisor. Your job is to generate precise,
         personalized daily meal instructions for a 7-day meal plan generator.
-        Alway provide the instructions according to the user profile and user eating sentiments.
+        based on the meal start date include the date in the instructions for each day.
+        meal start date is {meal_start_date if meal_start_date else "No need to mention the meal date in the instructions."}
+        Make sure date changes across days in the instructions if meal start date is provided.
 
-        Each day's plan must cover five meals: Breakfast, Mid-Morning Snack, Lunch, Evening Snack, and Dinner.
+        Always adapt to the user's profile and eating sentiments.
+        Ensure variety — do NOT repeat the same dishes, ingredients, or meal patterns across days.
+
+        Each day must include exactly five meals:
+        Breakfast, Mid-Morning Snack, Lunch, Evening Snack, Dinner.
 
         USER PROFILE:
         {profile}
@@ -725,15 +751,42 @@ async def MealPlanInstructor(
         USER'S PAST EATING SENTIMENTS & PREFERENCES:
         {eating_sentiments if eating_sentiments else "No previous data available."}
 
-        RULES:
-        - Tailor instructions to the user's health conditions (e.g., no high-sugar meals for diabetics, low-sodium for hypertension).
-        - Respect dietary restrictions and allergies strictly.
-        - Avoid repeating the same meals across days — ensure variety.
-        - Keep calorie targets aligned with the user's calorie goal.
-        - Instructions should be concise and directive (e.g., "Include a high-protein breakfast with eggs or Greek yogurt").
-        - Do NOT include actual recipes — only meal composition guidance.
+        STRICT RULES:
+        - Respect all health conditions (e.g., low sugar for diabetes, low sodium for hypertension).
+        - Respect all dietary restrictions and allergies.
+        - Ensure HIGH PROTEIN distribution across the day (each main meal must include a protein source).
+        - Balance macronutrients (protein, carbs, fats) — avoid carb-heavy plans.
+        - Ensure vegetable diversity across the week (different vegetables each day).
+        - Avoid repeating:
+        - same dishes
+        - same side items (e.g., chutneys, snacks)
+        - same cooking styles
+        - Include cuisine variety when possible (not the same cuisine every day).
+        - Keep meals realistic and culturally appropriate.
 
-        Respond ONLY with a valid JSON object. No explanation, no markdown.
+        OUTPUT FORMAT:
+        Return ONLY a valid JSON object in this exact structure:
+
+        {{
+        "Day1": {{
+            "Date": "DD-MM-YYYY",
+            "Breakfast": "...",
+            "MidMorningSnack": "...",
+            "Lunch": "...",
+            "EveningSnack": "...",
+            "Dinner": "..."
+        }},
+        "Day2": {{ ... }},
+        ...
+        "Day7": {{ ... }}
+        }}
+
+        INSTRUCTIONS STYLE:
+        - Be concise and directive.
+        - Describe WHAT to eat, not HOW to cook.
+        - Do NOT include recipes or steps.
+
+        Return ONLY JSON. No explanation, no markdown.
         """
 
     structured_llm = llm.with_structured_output(MealPlanInstructions)
@@ -807,7 +860,7 @@ graph.add_edge('DaySevenMealPlan', 'FinalMealPlan')
 graph.add_edge('FinalMealPlan', END)
 workflow = graph.compile()
 
-def generate_meal_plan_json(
+async def generate_meal_plan_json(
     age: int,
     gender: str,
     weight: float,
@@ -821,6 +874,7 @@ def generate_meal_plan_json(
     preferred_cuisines: Optional[List[str]] = None,
     meal_plan_style: Optional[str] = None,
     meal_plan_instructions: Optional[str] = None,
+    meal_start_date: Optional[str] = None,
 ) -> MealPlanSchema:
     dietary_restrictions = dietary_restrictions or []
     allergies = allergies or []
@@ -855,6 +909,7 @@ def generate_meal_plan_json(
 
     prompt = (
         "Return ONLY valid JSON matching MealPlanSchema.\n"
+        f"Date: {meal_start_date or 'Not specified'}\n"
         f"User: age {age}, gender {gender}, {weight}kg, {height}cm, activity {activity_level}/5. "
         f"Day kcal {rounded_total}.\n"
         f"Restrictions: {dietary_restrictions or 'None'}. Allergies (avoid): {allergies or 'None'}. "
@@ -887,7 +942,7 @@ def generate_meal_plan_json(
 
     logger.info("Prompt to LLM\n%s", prompt)
     structured_llm = llm.with_structured_output(MealPlanSchema)
-    return structured_llm.invoke(prompt)
+    return await structured_llm.ainvoke(prompt)
 
 def prompt(
         age: int,
@@ -902,8 +957,9 @@ def prompt(
         chronic_conditions: Optional[List[str]] = None,
         preferred_cuisines: Optional[List[str]] = None,
         meal_plan_style: Optional[str] = None,
-        meal_plan_instructions: Optional[str] = None,)->str:
-    
+        meal_plan_instructions: Optional[str] = None,
+) -> str:
+
     dietary_restrictions = dietary_restrictions or []
     allergies = allergies or []
     foods_to_avoid = foods_to_avoid or []
@@ -1098,216 +1154,87 @@ def build_row_from_llm_item(
         Notes=to_str_or_empty(item.Notes),
     )
 
-#-----------------------------------#
-# UPDATE PROFILE
-#-----------------------------------#
-async def update_weight(weight: int, user_id:str):
-    conn = await get_db_connection_dynamic(DYNAMIC_DB_NAME)
 
+# ── Internal helper (not a tool) ──────────────────────────────────────────────
+def _validate_date(date_str: str, field_name: str) -> str:
+    """
+    Validate and normalise a date string to YYYY-MM-DD.
+    Accepts both YYYY-MM-DD and DD-MM-YYYY (MealPlanSchema format).
+    Raises ValueError with a descriptive message on failure.
+    """
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            parsed = datetime.strptime(date_str.strip(), fmt)
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Invalid date format for '{field_name}': '{date_str}'. "
+        f"Expected YYYY-MM-DD or DD-MM-YYYY (e.g. 2025-07-21 or 21-07-2025)."
+    )
+
+async def _save_meal_plan_to_db(
+    user_id: str,
+    meal_date_raw: str,
+    meal_plan: Any,
+) -> None:
+    """
+    Internal helper — writes one day's meal plan to the meal_plans table
+    with is_confirmed = 0 (pending).
+ 
+    Called automatically by generate_meal_plan immediately after generation.
+    Never exposed to the LLM as a tool.
+ 
+    Args:
+        user_id:       The current user's ID.
+        meal_date_raw: Date string in either YYYY-MM-DD or DD-MM-YYYY format.
+        meal_plan:     Pydantic model, dict, list, or JSON string.
+    """
+    from main import graph_state
+ 
+    conn = graph_state.get("meal_plans_conn")
+    if conn is None:
+        logger.error("[_save_meal_plan_to_db] meal_plans_conn not available — plan not saved.")
+        return
+ 
+    # Normalise date to YYYY-MM-DD
     try:
-        cursor = conn.cursor()
-
-        query = """
-        INSERT INTO member.WeightRecords
-        (
-            RecordedDate,
-            MemberID,
-            WeightMeasurement,
-            unit,
-            Deleted,
-            CreatedDate,
-            CreatedBy,
-            UserId
-        )
-        VALUES
-        (
-            GETDATE(),
-            ?,
-            ?,
-            ?,
-            ?,
-            GETDATE(),
-            ?,
-            ?
-        )
-        """
-
-        values = (
-            1,
-            weight,
-            'lbs',
-            0,
-            'user',
-            user_id
-        )
-
-        cursor.execute(query, values)
-        conn.commit()
-
-    finally:
-        cursor.close()
-        conn.close()
-
-async def update_height(height: int, user_id: str):
-    conn = await get_db_connection_dynamic(DYNAMIC_DB_NAME)
-
+        normalised_date = _validate_date(meal_date_raw, "meal_date")
+    except ValueError as ve:
+        logger.error("[_save_meal_plan_to_db] %s", ve)
+        return
+ 
+    # Serialise plan to JSON text
+    if hasattr(meal_plan, "model_dump"):          # Pydantic model
+        meal_plan_json = json.dumps(meal_plan.model_dump(), ensure_ascii=False, default=str)
+    elif isinstance(meal_plan, str):
+        try:
+            meal_plan_json = json.dumps(json.loads(meal_plan), ensure_ascii=False)
+        except json.JSONDecodeError:
+            meal_plan_json = meal_plan
+    else:
+        meal_plan_json = json.dumps(meal_plan, ensure_ascii=False, default=str)
+ 
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+ 
     try:
-        cursor = conn.cursor()
-
-        query = """
-        INSERT INTO Member.HeightRecords
-        (
-            RecordedDate,
-            MemberID,
-            HeightMeasurement,
-            unit,
-            Differences,
-            Deleted,
-            CreatedDate,
-            CreatedBy,
-            UserId
+        await conn.execute(
+            """
+            INSERT INTO meal_plans (user_id, meal_date, meal_plan, is_confirmed, created_at, updated_at)
+            VALUES (?, ?, ?, 0, ?, ?)
+            ON CONFLICT(user_id, meal_date)
+            DO UPDATE SET
+                meal_plan    = excluded.meal_plan,
+                is_confirmed = 0,
+                updated_at   = excluded.updated_at
+            """,
+            (user_id, normalised_date, meal_plan_json, now_iso, now_iso),
         )
-        VALUES
-        (
-            GETDATE(),
-            ?,
-            ?,
-            ?,
-            ?,
-            ?,
-            GETDATE(),
-            ?,
-            ?
+        await conn.commit()
+        logger.info(
+            "[_save_meal_plan_to_db] ✅ Pending plan written for user=%s date=%s.",
+            user_id, normalised_date,
         )
-        """
-
-        values = (
-            101,        # MemberID (change if needed)
-            height,     # HeightMeasurement
-            'in',       # unit
-            '0',        # Differences
-            0,          # Deleted
-            'system',   # CreatedBy
-            user_id
-        )
-
-        cursor.execute(query, values)
-        conn.commit()
-
     except Exception as e:
-        conn.rollback()
-        raise e
-
-    finally:
-        cursor.close()
-        conn.close()
-
-async def update_activity_level(level: str, user_id: str):
-    conn = await get_db_connection_dynamic(DYNAMIC_DB_NAME)
-
-    try:
-        cursor = conn.cursor()
-
-        query = """
-        UPDATE ActivityLevelTemporaryTable
-        SET ActivityLevel = ?
-        WHERE UserId = ?;
-        """
-
-        values = (
-            level,
-            user_id,
-        )
-
-        cursor.execute(query, values)
-        conn.commit()
-
-    except Exception as e:
-        conn.rollback()
-        raise e
-
-    finally:
-        cursor.close()
-        conn.close()
-
-async def get_activity_level(user_id):
-    conn = await get_db_connection_dynamic(DYNAMIC_DB_NAME)
-
-    try:
-        cursor = conn.cursor()
-
-        query = """
-        SELECT ActivityLevel 
-        FROM ActivityLevelTemporaryTable
-        WHERE UserId = ?;
-        """
-
-        values = (user_id,)
-
-        cursor.execute(query, values)
-
-        result = cursor.fetchone()  # fetch one row
-
-        return result[0] if result else None
-
-    except Exception as e:
-        raise e
-
-    finally:
-        cursor.close()
-        conn.close()
-
-async def update_calories(calories: str, user_id: str):
-    conn = await get_db_connection_dynamic(DYNAMIC_DB_NAME)
-
-    try:
-        cursor = conn.cursor()
-
-        query = """
-        UPDATE CaloriesTemporaryTable
-        SET Calories = ?
-        WHERE UserId = ?;
-        """
-
-        values = (
-            calories,
-            user_id,
-        )
-
-        cursor.execute(query, values)
-        conn.commit()
-
-    except Exception as e:
-        conn.rollback()
-        raise e
-
-    finally:
-        cursor.close()
-        conn.close()
-
-async def get_calories(user_id):
-    conn = await get_db_connection_dynamic(DYNAMIC_DB_NAME)
-
-    try:
-        cursor = conn.cursor()
-
-        query = """
-        SELECT Calories 
-        FROM CaloriesTemporaryTable
-        WHERE UserId = ?;
-        """
-
-        values = (user_id,)
-
-        cursor.execute(query, values)
-
-        result = cursor.fetchone()  # fetch one row
-
-        return result[0] if result else None
-
-    except Exception as e:
-        raise e
-
-    finally:
-        cursor.close()
-        conn.close()
+        logger.error("[_save_meal_plan_to_db] DB write failed: %s", e)
+ 
