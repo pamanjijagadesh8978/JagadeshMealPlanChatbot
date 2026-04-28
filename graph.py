@@ -14,25 +14,23 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import InjectedState, ToolNode
 from pydantic import BaseModel, Field
 from typing import TypedDict
-
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import json
 from utils import (
     retrieve_all_memories,
     retrieve_memories,
+    retrieve_user_profile_sql_lite,
     update_memory,
-    get_user_profile,
-    retrive_user_profile_sql_lite,
     clean_profile,
     workflow,
     generate_meal_plan_json,
     prompt,
-    update_weight,
-    update_height,
-    update_activity_level,
-    get_activity_level,
-    update_calories,
-    get_calories,
-    MealPlanInstructor
+    MealPlanInstructor,
+    _save_meal_plan_to_db,
+    _validate_date,
 )
+_DATE_FORMAT = "%Y-%m-%d"
 
 
 # ─────────────────────────────────────────────
@@ -47,6 +45,7 @@ logging.basicConfig(
 logger = logging.getLogger("chatbot.memory")
 
 from langchain_openai import ChatOpenAI
+
 base_url = os.getenv("EXPERT_LLM_BASE_URL")
 api_key = os.getenv("EXPERT_LLM_API_KEY")
 model = os.getenv("EXPERT_LLM_MODEL")
@@ -67,7 +66,6 @@ MESSAGES_TO_KEEP = 6      # how many recent messages to preserve verbatim
 # ─────────────────────────────────────────────
 # 1. STATE DEFINITION
 # ─────────────────────────────────────────────
-
 class State(TypedDict):
     """
     Graph state.
@@ -111,63 +109,21 @@ async def get_profile(state: Annotated[dict, InjectedState]) -> str:
             logger.warning("get_profile called but user_id is missing from state.")
             return "Error: user_id not found in state"
 
-        profile = await get_user_profile("FriskaAiCCM_HFWL", user_id)
-        print(f"Profile: {profile}")
-        if not profile:
-            return "Error: profile not found"
-
-        logger.info("get_profile: profile fetched for user_id=%s", user_id)
-
-        # ── Enrich profile with computed fields BEFORE saving ────────────────
-        # ✅ Fix 5: fetch these first so they are included in the INSERT
-        activity_level = await get_activity_level(user_id)
-        calories       = await get_calories(user_id)
-        profile["activity_level"] = activity_level
-        profile["calories"]       = calories
-
-        # ── Clean and persist to local SQLite ────────────────────────────────
-        cleaned = clean_profile(profile, user_id)  # must return keys below
-        from main import graph_state 
+        from main import graph_state
         conn = graph_state.get("profile_conn")
         if conn is None:
+            logger.error("get_profile: Database connection not available in graph_state.")
             return "Error: Database connection not available."
-
-        await conn.execute(
-            """
-            INSERT OR REPLACE INTO UserHealthProfile (
-                user_id,
-                Name, Age, Gender,
-                WeightKG, HeightCM, WaistCircumferenceCM,
-                Cuisine, ActivityLevel, Calories,
-                DietaryPreference, Restrictions, DigestiveIssues,
-                Allergies, SymptomAggravatingFoods,
-                HeartRate, BloodPressure, BodyTemperature,
-                BloodOxygen, RespiratoryRate,
-                MedicalConditions, Goals,
-                ModifiedDate
-            ) VALUES (
-                :user_id,
-                :name, :age, :gender,
-                :weight_kg, :height_cm, :waist_circumference_cm,
-                :cuisine, :activity_level, :calories,
-                :dietary_preference, :restrictions, :digestive_issues,
-                :allergies, :symptom_aggravating_foods,
-                :heart_rate, :blood_pressure, :body_temperature,
-                :blood_oxygen, :respiratory_rate,
-                :medical_conditions, :goals,
-                datetime('now')
-            )
-            """,
-            cleaned,
-        )
-        await conn.commit()
-        logger.info("get_profile: profile for user_id=%s saved to local SQLite.", user_id)
-        logger.info("Profile Type: %s, Profile: %s", type(profile), profile)
-        return str(profile)
-
+        profile = await retrieve_user_profile_sql_lite(user_id, conn)
+        if not profile:
+            logger.info("get_profile: No profile found for user_id=%s.", user_id)
+            return "No profile data available."
+        cleaned = clean_profile(profile)
+        logger.info("get_profile: Retrieved and cleaned profile for user_id=%s.", user_id)
+        return cleaned
     except Exception as e:
         logger.error("get_profile error: %s", str(e))
-        return f"Error fetching profile: {str(e)}"
+        return f"Error retrieving profile: {str(e)}"
 
 @tool
 async def update_user_profile(
@@ -204,8 +160,8 @@ async def update_user_profile(
         age:                          Age of the user
         gender:                       Gender of the user
         weight_kg:                    Weight in kilos
-        height_cm:                    Height in inches
-        waist_circumference_cm:       Waist circumference in inches
+        height_cm:                    Height in centimeters
+        waist_circumference_cm:       Waist circumference in centimeters
         cuisine:                      Preferred cuisine type
         activity_level:               Physical activity level
         calories:                     Caloric intake or target (e.g. '2000 kcal')
@@ -318,16 +274,6 @@ async def update_user_profile(
         updated = ", ".join(FIELD_MAP[p] for p in provided)
         logger.info("update_user_profile: updated [%s] for user_id=%s.", updated, user_id)
 
-        # ✅ Fixed: use `is not None` to correctly handle 0.0 values
-        if weight_kg is not None:
-            await update_weight(weight_kg, user_id)
-        if height_cm is not None:
-            await update_height(height_cm, user_id)
-        if activity_level is not None:
-            await update_activity_level(activity_level, user_id)
-        if calories is not None:
-            await update_calories(calories, user_id)
-
         return f"Successfully updated [{updated}] for user_id={user_id}."
 
     except Exception as e:
@@ -436,6 +382,7 @@ async def generate_meal_plan(
     meal_plan_style: Optional[str] = None,
     meal_plan_instructions: Optional[str] = None,
     meal_plan_instructions_by_day: Optional[List[Optional[str]]] = None,
+    meal_start_date: Optional[str] = None,
     days: int = 1,
 ) -> Any:
     """
@@ -463,7 +410,7 @@ async def generate_meal_plan(
         if meal_plan_instructions_by_day:
             meal_plan_instructions = meal_plan_instructions_by_day[0]
 
-        return generate_meal_plan_json(
+        result = await generate_meal_plan_json(
             age=age,
             gender=gender,
             weight=weight,
@@ -477,28 +424,15 @@ async def generate_meal_plan(
             preferred_cuisines=preferred_cuisines,
             meal_plan_style=meal_plan_style,
             meal_plan_instructions=meal_plan_instructions,
+            meal_start_date=meal_start_date,
         )
+        user_id = state["user_id"]
+        if result and result.meal_date:
+            await _save_meal_plan_to_db(user_id, result.meal_date, result)
+            logger.info("[generate_meal_plan] Single-day plan auto-saved for user=%s", user_id)
 
-    # if days == 7 and meal_plan_instructions_by_day is None:
-    #     return {
-    #         "error": True,
-    #         "message": (
-    #             "days = 7 requires meal_plan_instructions_by_day (list length == 7). "
-    #             "Provide it, or provide meal_plan_instructions to apply to all days."
-    #         ),
-    #         "expected": {"meal_plan_instructions_by_day_length": days},
-    #         "received": {"meal_plan_instructions_by_day": None},
-    #     }
-
-    # if not isinstance(meal_plan_instructions_by_day, list):
-    #     raise TypeError("meal_plan_instructions_by_day must be a list when provided.")
-
-    # if len(meal_plan_instructions_by_day) != days:
-    #     raise ValueError(
-    #         f"meal_plan_instructions_by_day must have exactly {days} items, "
-    #         f"but got {len(meal_plan_instructions_by_day)}."
-    #     )
-    
+        return result
+      
     profile = {
         "age": age,
         "gender": gender,
@@ -518,7 +452,7 @@ async def generate_meal_plan(
     conn = graph_state.get("memory_conn")
     user_id = state["user_id"]
     # meal_plan_instructions = await MealPlanInstructor(user_id, conn, profile)
-    _instructions = await MealPlanInstructor(user_id, conn, profile)
+    _instructions = await MealPlanInstructor(user_id, conn, profile, meal_start_date=meal_start_date)
     meal_plan_instructions_by_day = [
     _instructions.Day1Instructions,
     _instructions.Day2Instructions,
@@ -555,7 +489,28 @@ async def generate_meal_plan(
     }
 
     result = await workflow.ainvoke(initial_state)
-    return result["final7daymealplan"]
+    final_plan = result["final7daymealplan"]
+
+    # ── Auto-save all 7 days ───────────────────────────────────────────────
+    user_id = state["user_id"]
+    day_keys = ["day1meal", "day2meal", "day3meal", "day4meal",
+                "day5meal", "day6meal", "day7meal"]
+
+    for key in day_keys:
+        day_plan = final_plan.get(key)
+        if day_plan is None:
+            continue
+        # MealPlanSchema object → get meal_date attribute
+        meal_date_val = (
+            day_plan.meal_date                        # if still a Pydantic object
+            if hasattr(day_plan, "meal_date")
+            else (day_plan.get("meal_date") if isinstance(day_plan, dict) else None)
+        )
+        if meal_date_val:
+            await _save_meal_plan_to_db(user_id, meal_date_val, day_plan)
+
+    logger.info("[generate_meal_plan] 7-day plan auto-saved for user=%s", user_id)
+    return final_plan
 
 @tool
 async def nutritional_expert_analysis(query: str) -> dict:
@@ -594,7 +549,7 @@ async def nutritional_expert_analysis(query: str) -> dict:
         }
 
 @tool
-async def get_expert_analysis_for_user_query(
+async def get_personalised_expert_analysis_for_user_query(
     query: str,
     state: Annotated[dict, InjectedState]
 ) -> dict:
@@ -635,12 +590,12 @@ async def get_expert_analysis_for_user_query(
         user_id = state.get("user_id")
         if not user_id:
             return {"error": "User ID not found in state."}
-        from graph import graph_state
+        from main import graph_state
         conn = graph_state.get("profile_conn")
         if not conn:
             return {"error": "Profile DB connection not available."}
 
-        profile = await retrieve_user_profile_sqlite(user_id, conn)
+        profile = await retrieve_user_profile_sql_lite(user_id, conn)
         if not profile:
             profile = "No profile data available."
 
@@ -662,7 +617,554 @@ async def get_expert_analysis_for_user_query(
             "error": f"Error during personalized analysis: {str(e)}"
         }
 
-TOOLS = [get_profile, update_user_profile, daily_calorie_requirement, generate_meal_plan, get_expert_analysis_for_user_query, nutritional_expert_analysis]
+@tool
+async def save_meal_plan(
+    state: Annotated[dict, InjectedState],
+    meal_date: str,
+) -> dict:
+    """
+    Confirm and permanently save a meal plan that was previously generated.
+ 
+    When a meal plan is generated it is stored as PENDING (is_confirmed = 0).
+    Call this tool ONLY after the user explicitly agrees to save the plan.
+    It flips is_confirmed from 0 → 1 for the given date, marking the plan
+    as permanently accepted by the user.
+ 
+    Args:
+        state:     LangGraph injected state — provides user_id automatically.
+        meal_date: The date of the meal plan to confirm, in YYYY-MM-DD format
+                   (e.g. "2025-07-21").
+ 
+    Returns:
+        dict with keys:
+            success      (bool) – True if confirmed successfully.
+            message      (str)  – Human-readable status.
+            user_id      (str)  – The current user.
+            meal_date    (str)  – The confirmed date.
+            is_confirmed (int)  – 1 if confirmed, 0 if not found / already pending.
+    """
+    try:
+        user_id = state.get("user_id")
+        if not user_id:
+            return {"success": False, "message": "Error: user_id not found in state."}
+ 
+        normalised_date = _validate_date(meal_date, "meal_date")
+ 
+        from main import graph_state
+        conn = graph_state.get("meal_plans_conn")
+        if conn is None:
+            return {"success": False, "message": "Error: Meal plans database connection not available."}
+ 
+        # Check whether a pending plan actually exists for this date
+        cursor = await conn.execute(
+            "SELECT is_confirmed FROM meal_plans WHERE user_id = ? AND meal_date = ?",
+            (user_id, normalised_date),
+        )
+        row = await cursor.fetchone()
+ 
+        if row is None:
+            return {
+                "success":      False,
+                "message":      (
+                    f"No meal plan found for {normalised_date}. "
+                    "Please generate a meal plan first."
+                ),
+                "user_id":      user_id,
+                "meal_date":    normalised_date,
+                "is_confirmed": 0,
+            }
+ 
+        if row[0] == 1:
+            return {
+                "success":      True,
+                "message":      f"Meal plan for {normalised_date} is already confirmed.",
+                "user_id":      user_id,
+                "meal_date":    normalised_date,
+                "is_confirmed": 1,
+            }
+ 
+        # Flip is_confirmed to 1 and record the confirmation timestamp
+        now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        await conn.execute(
+            """
+            UPDATE meal_plans
+            SET    is_confirmed = 1,
+                   updated_at   = ?
+            WHERE  user_id   = ?
+              AND  meal_date  = ?
+            """,
+            (now_iso, user_id, normalised_date),
+        )
+        await conn.commit()
+ 
+        logger.info(
+            "[save_meal_plan] ✅ Confirmed meal plan for user_id=%s, date=%s.",
+            user_id, normalised_date,
+        )
+        return {
+            "success":      True,
+            "message":      f"Meal plan for {normalised_date} has been confirmed and saved.",
+            "user_id":      user_id,
+            "meal_date":    normalised_date,
+            "is_confirmed": 1,
+        }
+ 
+    except ValueError as ve:
+        return {"success": False, "message": str(ve)}
+    except Exception as e:
+        logger.error("[save_meal_plan] Error: %s", str(e))
+        return {"success": False, "message": f"Error confirming meal plan: {str(e)}"}
+ 
+@tool
+async def get_meal_plan(
+    state: Annotated[dict, InjectedState],
+    meal_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    confirmed_only: bool = False,
+) -> dict:
+    """
+    Retrieve previously saved meal plan(s) for the current user.
+ 
+    Supports two query modes — provide exactly one:
+ 
+    Mode 1 — Single day:
+        Pass `meal_date` (YYYY-MM-DD) to fetch the plan for that specific date.
+ 
+    Mode 2 — Date range:
+        Pass both `start_date` AND `end_date` (YYYY-MM-DD) to fetch all plans
+        within the inclusive date range.
+ 
+    Args:
+        state:          LangGraph injected state — provides user_id automatically.
+        meal_date:      Exact date to query (YYYY-MM-DD).  Used for single-day lookup.
+        start_date:     Range start date (YYYY-MM-DD).  Used together with end_date.
+        end_date:       Range end date   (YYYY-MM-DD).  Used together with start_date.
+        confirmed_only: If True, return ONLY confirmed (user-accepted) plans.
+                        If False (default), return ALL plans including pending ones.
+                        Use True when the user asks to see their saved/confirmed plans.
+                        Use False when checking whether a plan exists at all.
+ 
+    Returns:
+        dict with keys:
+            success        (bool)        – True if query ran without errors.
+            user_id        (str)         – The current user.
+            query_mode     (str)         – "single_day" | "date_range".
+            meal_plans     (list[dict])  – Zero or more plan records, each containing:
+                                            meal_date    (str)
+                                            meal_plan    (Any)  parsed from JSON
+                                            is_confirmed (int)  1 = confirmed, 0 = pending
+                                            created_at   (str)
+                                            updated_at   (str)
+            count          (int)         – Number of records returned.
+            message        (str)         – Human-readable status.
+    """
+    try:
+        user_id = state.get("user_id")
+        if not user_id:
+            return {"success": False, "message": "Error: user_id not found in state."}
+ 
+        from main import graph_state
+        conn = graph_state.get("meal_plans_conn")
+        if conn is None:
+            return {"success": False, "message": "Error: Meal plans database connection not available."}
+ 
+        # ── Build confirmation filter clause ───────────────────────────────
+        confirm_clause = "AND is_confirmed = 1" if confirmed_only else ""
+ 
+        # ── Determine query mode ───────────────────────────────────────────
+        has_single  = meal_date is not None
+        has_range   = start_date is not None and end_date is not None
+        has_partial = (start_date is None) != (end_date is None)  # XOR
+ 
+        if has_partial:
+            return {
+                "success": False,
+                "message": "Both start_date and end_date must be provided together for a range query.",
+            }
+ 
+        if not has_single and not has_range:
+            return {
+                "success": False,
+                "message": (
+                    "Provide either 'meal_date' for a single-day lookup, "
+                    "or both 'start_date' and 'end_date' for a range query."
+                ),
+            }
+ 
+        if has_single:
+            # ── Mode 1: single day ─────────────────────────────────────────
+            normalised = _validate_date(meal_date, "meal_date")
+            cursor = await conn.execute(
+                f"""
+                SELECT meal_date, meal_plan, is_confirmed, created_at, updated_at
+                FROM   meal_plans
+                WHERE  user_id   = ?
+                  AND  meal_date = ?
+                  {confirm_clause}
+                """,
+                (user_id, normalised),
+            )
+            rows = await cursor.fetchall()
+            query_mode = "single_day"
+ 
+        else:
+            # ── Mode 2: date range ─────────────────────────────────────────
+            norm_start = _validate_date(start_date, "start_date")
+            norm_end   = _validate_date(end_date,   "end_date")
+ 
+            if norm_start > norm_end:
+                return {
+                    "success": False,
+                    "message": f"start_date ({norm_start}) must be on or before end_date ({norm_end}).",
+                }
+ 
+            cursor = await conn.execute(
+                f"""
+                SELECT meal_date, meal_plan, is_confirmed, created_at, updated_at
+                FROM   meal_plans
+                WHERE  user_id   = ?
+                  AND  meal_date >= ?
+                  AND  meal_date <= ?
+                  {confirm_clause}
+                ORDER BY meal_date ASC
+                """,
+                (user_id, norm_start, norm_end),
+            )
+            rows = await cursor.fetchall()
+            query_mode = "date_range"
+ 
+        # ── Parse rows ─────────────────────────────────────────────────────
+        records = []
+        for row in rows:
+            meal_date_val, meal_plan_json, is_confirmed, created_at, updated_at = row
+            try:
+                meal_plan_parsed = json.loads(meal_plan_json)
+            except (json.JSONDecodeError, TypeError):
+                meal_plan_parsed = meal_plan_json
+ 
+            records.append({
+                "meal_date":    meal_date_val,
+                "meal_plan":    meal_plan_parsed,
+                "is_confirmed": is_confirmed,   # 1 = confirmed, 0 = pending
+                "created_at":   created_at,
+                "updated_at":   updated_at,
+            })
+ 
+        count = len(records)
+        filter_label = "confirmed " if confirmed_only else ""
+ 
+        if count == 0:
+            message = f"No {filter_label}meal plans found for the specified criteria."
+        elif count == 1:
+            status  = "✅ Confirmed" if records[0]["is_confirmed"] else "⏳ Pending"
+            message = f"Found 1 {filter_label}meal plan for {records[0]['meal_date']} ({status})."
+        else:
+            message = (
+                f"Found {count} {filter_label}meal plans "
+                f"from {records[0]['meal_date']} to {records[-1]['meal_date']}."
+            )
+ 
+        logger.info(
+            "[get_meal_plan] user_id=%s mode=%s confirmed_only=%s returned %d record(s).",
+            user_id, query_mode, confirmed_only, count,
+        )
+ 
+        return {
+            "success":    True,
+            "user_id":    user_id,
+            "query_mode": query_mode,
+            "meal_plans": records,
+            "count":      count,
+            "message":    message,
+        }
+ 
+    except ValueError as ve:
+        return {"success": False, "message": str(ve)}
+    except Exception as e:
+        logger.error("[get_meal_plan] Error: %s", str(e))
+        return {"success": False, "message": f"Error retrieving meal plan: {str(e)}"}
+ 
+@tool
+async def log_meal(
+    state: Annotated[dict, InjectedState],
+    meal_name: str,
+    meal_type: str,
+    meal_occasion: str,
+    consumed_date: Optional[str] = None,
+    consumed_time: Optional[str] = None,
+    calories: Optional[float] = None,
+    protein_g: Optional[float] = None,
+    carbohydrates_g: Optional[float] = None,
+    fats_g: Optional[float] = None,
+    fiber_g: Optional[float] = None,
+    sugar_g: Optional[float] = None,
+    sodium_mg: Optional[float] = None,
+    notes: Optional[str] = None,
+) -> dict:
+    """
+    Log a meal that the user has consumed.
+ 
+    Use this tool when the user says they ate, had, or consumed something,
+    or when they want to track a meal they just finished.
+ 
+    Args:
+        state:           LangGraph injected state — provides user_id automatically.
+        meal_name:       Name or description of the meal (e.g. 'Grilled chicken salad').
+        meal_type:       Category of the meal (e.g. 'home-cooked', 'restaurant',
+                         'packaged', 'snack').
+        meal_occasion:   When in the day the meal was eaten. Must be one of:
+                         'breakfast', 'morning_snack', 'lunch', 'afternoon_snack',
+                         'dinner', 'late_night_snack'.
+        consumed_date:   Date the meal was consumed in YYYY-MM-DD format.
+                         Defaults to today if not provided.
+        consumed_time:   Time the meal was consumed in HH:MM (24-hour) format.
+                         Defaults to current time if not provided.
+        calories:        Total calories in kcal.
+        protein_g:       Protein content in grams.
+        carbohydrates_g: Carbohydrate content in grams.
+        fats_g:          Fat content in grams.
+        fiber_g:         Fiber content in grams.
+        sugar_g:         Sugar content in grams.
+        sodium_mg:       Sodium content in milligrams.
+        notes:           Any extra notes (e.g. 'added extra dressing', 'half portion').
+ 
+    Returns:
+        dict with keys: success, message, meal_id, user_id, consumed_date, consumed_time.
+    """
+    VALID_OCCASIONS = {
+        "breakfast", "morning_snack", "lunch",
+        "afternoon_snack", "dinner", "late_night_snack",
+    }
+ 
+    try:
+        user_id = state.get("user_id")
+        if not user_id:
+            return {"success": False, "message": "Error: user_id not found in state."}
+ 
+        if meal_occasion.lower() not in VALID_OCCASIONS:
+            return {
+                "success": False,
+                "message": (
+                    f"Invalid meal_occasion '{meal_occasion}'. "
+                    f"Must be one of: {', '.join(sorted(VALID_OCCASIONS))}."
+                ),
+            }
+ 
+        now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+ 
+        if consumed_date:
+            normalised_date = _validate_date(consumed_date, "consumed_date")
+        else:
+            normalised_date = now_ist.strftime(_DATE_FORMAT)
+ 
+        if consumed_time:
+            # Accept HH:MM or HH:MM:SS — normalise to HH:MM
+            try:
+                t = datetime.strptime(consumed_time.strip(), "%H:%M:%S")
+            except ValueError:
+                t = datetime.strptime(consumed_time.strip(), "%H:%M")
+            normalised_time = t.strftime("%H:%M")
+        else:
+            normalised_time = now_ist.strftime("%H:%M")
+ 
+        now_iso = now_ist.strftime("%Y-%m-%dT%H:%M:%S")
+ 
+        from main import graph_state
+        conn = graph_state.get("consumed_meals_conn")
+        if conn is None:
+            return {"success": False, "message": "Error: Consumed meals database connection not available."}
+ 
+        cursor = await conn.execute(
+            """
+            INSERT INTO consumed_meals (
+                user_id, meal_name, meal_type, consumed_date, consumed_time,
+                meal_occasion, calories, protein_g, carbohydrates_g, fats_g,
+                fiber_g, sugar_g, sodium_mg, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id, meal_name.strip(), meal_type.strip(),
+                normalised_date, normalised_time, meal_occasion.lower(),
+                calories, protein_g, carbohydrates_g, fats_g,
+                fiber_g, sugar_g, sodium_mg,
+                notes.strip() if notes else None,
+                now_iso, now_iso,
+            ),
+        )
+        await conn.commit()
+        meal_id = cursor.lastrowid
+ 
+        logger.info(
+            "[log_meal] ✅ Logged meal id=%d for user_id=%s on %s at %s.",
+            meal_id, user_id, normalised_date, normalised_time,
+        )
+        return {
+            "success":       True,
+            "message":       (
+                f"'{meal_name}' logged as {meal_occasion} on "
+                f"{normalised_date} at {normalised_time}."
+            ),
+            "meal_id":       meal_id,
+            "user_id":       user_id,
+            "consumed_date": normalised_date,
+            "consumed_time": normalised_time,
+        }
+ 
+    except ValueError as ve:
+        return {"success": False, "message": str(ve)}
+    except Exception as e:
+        logger.error("[log_meal] Error: %s", str(e))
+        return {"success": False, "message": f"Error logging meal: {str(e)}"}
+
+@tool
+async def get_consumed_meals(
+    state: Annotated[dict, InjectedState],
+    consumed_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    meal_occasion: Optional[str] = None,
+) -> dict:
+    """
+    Retrieve meals the user has previously logged as consumed.
+ 
+    Supports two query modes — provide exactly one:
+ 
+    Mode 1 — Single day:
+        Pass `consumed_date` (YYYY-MM-DD) to fetch all logged meals for that date.
+ 
+    Mode 2 — Date range:
+        Pass both `start_date` AND `end_date` (YYYY-MM-DD) to fetch meals across
+        an inclusive date range.
+ 
+    Optionally filter by `meal_occasion` (e.g. 'breakfast', 'lunch', 'dinner').
+ 
+    Args:
+        state:          LangGraph injected state — provides user_id automatically.
+        consumed_date:  Exact date (YYYY-MM-DD) for a single-day lookup.
+        start_date:     Range start date (YYYY-MM-DD).
+        end_date:       Range end date   (YYYY-MM-DD).
+        meal_occasion:  Optional filter — one of: 'breakfast', 'morning_snack',
+                        'lunch', 'afternoon_snack', 'dinner', 'late_night_snack'.
+ 
+    Returns:
+        dict with keys:
+            success      (bool)
+            user_id      (str)
+            query_mode   (str)  – 'single_day' | 'date_range'
+            meals        (list[dict]) – each record contains all logged fields
+            count        (int)
+            message      (str)
+    """
+    try:
+        user_id = state.get("user_id")
+        if not user_id:
+            return {"success": False, "message": "Error: user_id not found in state."}
+ 
+        from main import graph_state
+        conn = graph_state.get("consumed_meals_conn")
+        if conn is None:
+            return {"success": False, "message": "Error: Consumed meals database connection not available."}
+ 
+        # ── Occasion filter ────────────────────────────────────────────────
+        occasion_clause = ""
+        occasion_param: list = []
+        if meal_occasion:
+            occasion_clause = "AND meal_occasion = ?"
+            occasion_param  = [meal_occasion.lower()]
+ 
+        # ── Determine query mode ───────────────────────────────────────────
+        has_single  = consumed_date is not None
+        has_range   = start_date is not None and end_date is not None
+        has_partial = (start_date is None) != (end_date is None)
+ 
+        if has_partial:
+            return {
+                "success": False,
+                "message": "Both start_date and end_date must be provided together for a range query.",
+            }
+ 
+        if not has_single and not has_range:
+            return {
+                "success": False,
+                "message": (
+                    "Provide either 'consumed_date' for a single-day lookup, "
+                    "or both 'start_date' and 'end_date' for a range query."
+                ),
+            }
+ 
+        COLUMNS = (
+            "id", "meal_name", "meal_type", "consumed_date", "consumed_time",
+            "meal_occasion", "calories", "protein_g", "carbohydrates_g", "fats_g",
+            "fiber_g", "sugar_g", "sodium_mg", "notes", "created_at",
+        )
+        SELECT = f"SELECT {', '.join(COLUMNS)} FROM consumed_meals"
+ 
+        if has_single:
+            normalised = _validate_date(consumed_date, "consumed_date")
+            cursor = await conn.execute(
+                f"""
+                {SELECT}
+                WHERE user_id = ? AND consumed_date = ?
+                {occasion_clause}
+                ORDER BY consumed_time ASC
+                """,
+                [user_id, normalised] + occasion_param,
+            )
+            query_mode = "single_day"
+        else:
+            norm_start = _validate_date(start_date, "start_date")
+            norm_end   = _validate_date(end_date,   "end_date")
+            if norm_start > norm_end:
+                return {
+                    "success": False,
+                    "message": f"start_date ({norm_start}) must be on or before end_date ({norm_end}).",
+                }
+            cursor = await conn.execute(
+                f"""
+                {SELECT}
+                WHERE user_id = ?
+                  AND consumed_date >= ? AND consumed_date <= ?
+                  {occasion_clause}
+                ORDER BY consumed_date ASC, consumed_time ASC
+                """,
+                [user_id, norm_start, norm_end] + occasion_param,
+            )
+            query_mode = "date_range"
+ 
+        rows  = await cursor.fetchall()
+        meals = [dict(zip(COLUMNS, row)) for row in rows]
+        count = len(meals)
+ 
+        if count == 0:
+            message = "No consumed meals found for the specified criteria."
+        elif count == 1:
+            message = f"Found 1 meal logged on {meals[0]['consumed_date']} at {meals[0]['consumed_time']}."
+        else:
+            message = f"Found {count} meals logged."
+ 
+        logger.info(
+            "[get_consumed_meals] user_id=%s mode=%s occasion=%s returned %d record(s).",
+            user_id, query_mode, meal_occasion, count,
+        )
+        return {
+            "success":    True,
+            "user_id":    user_id,
+            "query_mode": query_mode,
+            "meals":      meals,
+            "count":      count,
+            "message":    message,
+        }
+ 
+    except ValueError as ve:
+        return {"success": False, "message": str(ve)}
+    except Exception as e:
+        logger.error("[get_consumed_meals] Error: %s", str(e))
+        return {"success": False, "message": f"Error retrieving consumed meals: {str(e)}"}
+
+TOOLS = [get_profile, update_user_profile, daily_calorie_requirement, generate_meal_plan,
+         get_personalised_expert_analysis_for_user_query, nutritional_expert_analysis,
+         save_meal_plan, get_meal_plan, log_meal, get_consumed_meals]
 
 # ─────────────────────────────────────────────
 # 3. LLM + TOOL BINDING
@@ -673,8 +1175,10 @@ def build_llm() -> ChatMistralAI:
     Create the ChatMistralAI instance from environment variables.
     Set MISTRAL_ENDPOINT and MISTRAL_API_KEY before running.
     """
-    MISTRAL_ENDPOINT = os.getenv("MISTRAL_ENDPOINT")
-    MISTRAL_API_KEY  = os.getenv("MISTRAL_API_KEY")
+    MISTRAL_ENDPOINT = "https://patient-engagement.westus.models.ai.azure.com"
+    MISTRAL_API_KEY  = "lowOIwacBNGCr2nTUK9eHZfdyAO7D2mE"
+    # MISTRAL_ENDPOINT = os.getenv("MISTRAL_ENDPOINT", MISTRAL_ENDPOINT)
+    # MISTRAL_API_KEY  = os.getenv("MISTRAL_API_KEY", MISTRAL_API_KEY)
 
     if not MISTRAL_ENDPOINT or not MISTRAL_API_KEY:
         raise RuntimeError(
@@ -700,118 +1204,196 @@ class MemoryDecision(BaseModel):
 
 
 _MEMORY_PROMPT = """
-    You are a long-term memory extraction engine for a health and nutrition assistant.
-
-    Your role is to extract meaningful, persistent user information that can improve personalized nutrition, meal planning, and lifestyle guidance.
-
-    -------------------------
-    CURRENT USER MEMORY:
-    {user_details_content}
-
-    LATEST USER MESSAGE:
-    {user_message}
-    -------------------------
-
-    HEALTH-FOCUSED EXTRACTION RULES:
-
-    1. Extract ONLY long-term, stable, and reusable information related to:
-
-    A. DIET & FOOD PREFERENCES
-    - Foods the user likes or dislikes
-    - Favorite cuisines or meals
-    - Eating habits (e.g., "skips breakfast", "eats late at night")
-
-    B. DIETARY RESTRICTIONS
-    - Allergies (e.g., nuts, dairy)
-    - Intolerances (e.g., lactose intolerance)
-    - Diet types (e.g., vegetarian, vegan, keto)
-
-    C. HEALTH & FITNESS GOALS
-    - Weight loss, muscle gain, maintenance
-    - Fitness goals or routines
-    - Lifestyle improvements
-
-    D. HEALTH CONDITIONS (NON-DIAGNOSTIC ONLY)
-    - User-mentioned conditions (e.g., "has diabetes", "high BP")
-    - Only store if explicitly stated by the user
-    - DO NOT infer or assume
-
-    E. LIFESTYLE PATTERNS
-    - Sleep habits
-    - Activity levels
-    - Work schedule affecting meals
-
-    F. SKILL / KNOWLEDGE LEVEL
-    - Beginner/intermediate/advanced in fitness or nutrition
-
-    -------------------------
-
-    DO NOT STORE:
-    - One-time questions
-    - Temporary context (e.g., "What should I eat today?")
-    - Generic or obvious statements
-    - Assistant responses
-    - Medical advice or inferred conditions
-
-    -------------------------
-
-    MEMORY QUALITY RULES:
-
-    - Each memory must be:
-    • Atomic (one idea per entry)
-    • Clear and self-contained
-    • Written in third person
-    • Start with "User ..."
-
-    - Prefer SPECIFIC over generic:
-    ❌ "User likes healthy food"
-    ✅ "User prefers high-protein vegetarian meals"
-
-    - Avoid duplicates or near-duplicates from CURRENT USER MEMORY
-    - Only store if it adds NEW value
-
-    -------------------------
-
-    DECISION RULE:
-    - If NO useful long-term memory is found:
-    → should_write = false
-    → Tag: Is this memory related to meal plan or not
-
-    -------------------------
-
-    ADDITIONAL TAGGING RULE:
-
-    - For each memory, include a boolean field "is_mealplan"
-    - Set "is_mealplan": true if the memory is directly related to:
-    • Specific meals or meal plans
-    • Daily/weekly food plans
-    • Structured eating schedules
-
-    - Otherwise set "is_mealplan": false
-
-    -------------------------
-
-    OUTPUT FORMAT (STRICT JSON ONLY):
-
+You are a long-term memory extraction engine for Friska, a personalised health and nutrition assistant.
+ 
+Your sole job is to decide whether the user's latest message contains information worth storing
+permanently — and if so, extract it as clean, atomic memory entries.
+ 
+─────────────────────────────────────────────────────
+CONTEXT
+─────────────────────────────────────────────────────
+CURRENT USER MEMORY (already stored — do NOT duplicate):
+{user_details_content}
+ 
+LATEST USER MESSAGE:
+{user_message}
+ 
+─────────────────────────────────────────────────────
+THE GOLDEN RULE  (apply this first)
+─────────────────────────────────────────────────────
+Ask yourself:
+ 
+  "If this user comes back in two weeks and says nothing about this topic,
+   would knowing this memory make Friska's response meaningfully more personalised?"
+ 
+If YES  → candidate for storage.
+If NO   → discard immediately.
+ 
+─────────────────────────────────────────────────────
+WHAT TO STORE  (long-term, stable, reusable facts)
+─────────────────────────────────────────────────────
+A. FOOD PREFERENCES
+   - Specific foods or ingredients the user enjoys or dislikes
+   - Favourite cuisines (e.g., South Indian, Mediterranean)
+   - Preferred cooking styles (e.g., grilled over fried)
+   - Texture or flavour preferences (e.g., dislikes strong spices)
+ 
+B. DIETARY RESTRICTIONS & ALLERGIES
+   - Allergies stated by the user (e.g., peanuts, shellfish, dairy)
+   - Intolerances (e.g., lactose intolerance, gluten sensitivity)
+   - Chosen diet types (e.g., vegetarian, vegan, keto, intermittent fasting)
+   - Foods the user explicitly avoids for personal/religious reasons
+ 
+C. EATING HABITS & PATTERNS
+   - Meal timing preferences (e.g., skips breakfast, eats dinner late)
+   - Snacking habits (e.g., prefers light evening snacks)
+   - Portion tendencies (e.g., prefers smaller, more frequent meals)
+   - Cooking capacity (e.g., limited cooking time on weekdays)
+ 
+D. HEALTH CONDITIONS  (user-stated only — never inferred)
+   - Chronic conditions mentioned by the user (e.g., Type 2 diabetes, hypertension, PCOS)
+   - Digestive issues (e.g., IBS, acid reflux)
+   - Symptoms worsened by specific foods (e.g., "dairy causes bloating")
+ 
+E. HEALTH & FITNESS GOALS
+   - Weight goal (e.g., lose 5 kg, maintain current weight)
+   - Fitness goals (e.g., build muscle, improve stamina)
+   - Specific targets mentioned (e.g., wants to hit 2000 kcal/day, 150g protein)
+ 
+F. LIFESTYLE CONTEXT  (only if it directly affects nutrition recommendations)
+   - Activity level or exercise frequency (e.g., gyms 5x/week)
+   - Work schedule that shapes meal timing (e.g., night-shift worker)
+   - Sleep patterns if nutrition-relevant (e.g., poor sleep, asks about sleep-supportive foods)
+ 
+─────────────────────────────────────────────────────
+WHAT NEVER TO STORE  (hard blacklist)
+─────────────────────────────────────────────────────
+Discard ANY message that is primarily about:
+ 
+❌ MEAL PLAN REQUEST MECHANICS
+   - How many days of plan the user requested (1-day, 7-day, weekly, monthly)
+   - That the user asked for a meal plan at all
+   - Whether the user confirmed, saved, rejected, or regenerated a plan
+   - Calorie targets stated only as part of a plan generation request
+     (store the calorie goal ONLY if the user states it as a personal goal
+      independent of any specific plan request)
+ 
+   BAD: "User requested a 7-day meal plan."
+   BAD: "User wants a 1-day meal plan for today."
+   BAD: "User confirmed and saved their meal plan."
+   BAD: "User asked to regenerate the meal plan."
+   BAD: "User requested a meal plan starting from Monday."
+ 
+❌ ONE-TURN QUESTIONS WITH NO PERSISTENT VALUE
+   - Questions about what to eat today / this meal
+   - Requests for a single recipe lookup
+   - Asking for calorie counts of a specific food once
+   - Questions about whether a specific food is healthy in general
+ 
+   BAD: "User asked what to eat for lunch today."
+   BAD: "User wants to know the calorie count of an apple."
+   BAD: "User asked if rice is healthy."
+ 
+❌ TRANSIENT OR SESSION-SPECIFIC CONTEXT
+   - Start dates, end dates, or specific calendar dates mentioned for a plan
+   - That the user is in a specific week or day of a diet
+   - Temporary substitutions (e.g., "no eggs this week")
+ 
+   BAD: "User wants their meal plan to start on 2025-07-21."
+   BAD: "User said they have no eggs this week."
+ 
+❌ OBVIOUS / NON-ACTIONABLE STATEMENTS
+   - That the user wants healthy food (everyone does)
+   - That the user wants balanced meals
+   - That the user is trying to be healthier in general
+ 
+   BAD: "User wants to eat healthy."
+   BAD: "User wants balanced nutrition."
+ 
+❌ ASSISTANT ACTIONS OR SYSTEM EVENTS
+   - Tool calls, tool results, plan generation events
+   - Anything that describes what the assistant did rather than what the user said
+ 
+─────────────────────────────────────────────────────
+MEMORY QUALITY RULES
+─────────────────────────────────────────────────────
+Every memory entry MUST be:
+ 
+• Atomic       — one distinct fact per entry, never compound
+• Specific     — prefer concrete details over vague generalities
+• Self-contained — readable and meaningful with no extra context
+• Third-person — always start with "User ..."
+• User-stated  — never inferred, assumed, or extrapolated
+ 
+GOOD vs BAD examples:
+ 
+  ❌ "User likes healthy food."
+  ✅ "User prefers high-protein, low-carb meals."
+ 
+  ❌ "User has dietary restrictions."
+  ✅ "User is lactose intolerant and avoids all dairy products."
+ 
+  ❌ "User wants a 7-day meal plan."         ← REQUEST MECHANIC — never store
+  ✅ "User prefers South Indian cuisine for weekday meals."
+ 
+  ❌ "User asked Friska to generate a meal plan."   ← SYSTEM EVENT — never store
+  ✅ "User exercises at the gym 5 days a week and needs high-protein meals."
+ 
+  ❌ "User confirmed their meal plan."       ← SESSION ACTION — never store
+  ✅ "User prefers meals that take under 30 minutes to prepare."
+ 
+  ❌ "User wants meals starting from 2025-07-21."   ← DATE — never store
+  ✅ "User follows intermittent fasting and eats between 12 pm and 8 pm."
+ 
+─────────────────────────────────────────────────────
+DUPLICATE CHECK
+─────────────────────────────────────────────────────
+Before including any entry, compare it against CURRENT USER MEMORY.
+- If the same fact is already stored → set "is_new": false (will be skipped).
+- If it is genuinely new information → set "is_new": true.
+- If it refines or corrects an existing memory → set "is_new": true and write
+  the updated version (the old entry will be superseded on the next retrieval cycle).
+ 
+─────────────────────────────────────────────────────
+is_mealplan TAGGING RULE
+─────────────────────────────────────────────────────
+Set "is_mealplan": true ONLY for memories about what the user likes or dislikes
+TO EAT — food preferences, cuisine choices, meal timing habits, portion preferences.
+These are used to personalise future meal plan generation.
+ 
+Set "is_mealplan": false for everything else — health conditions, fitness goals,
+lifestyle patterns, activity level, sleep, etc.
+ 
+NOTE: A memory about requesting a meal plan (e.g., "user wants a 7-day plan")
+must NEVER reach this tagging step — it should have been discarded above.
+ 
+─────────────────────────────────────────────────────
+FINAL DECISION RULE
+─────────────────────────────────────────────────────
+After applying all the rules above:
+ 
+• If at least one valid, new, non-blacklisted memory was found:
+  → should_write = true
+  → Include only the valid entries in "memories"
+ 
+• If nothing passes the golden rule and blacklist check:
+  → should_write = false
+  → "memories" must be an empty list []
+ 
+─────────────────────────────────────────────────────
+OUTPUT FORMAT  (strict JSON only — no preamble, no explanation)
+─────────────────────────────────────────────────────
+{{
+  "should_write": boolean,
+  "memories": [
     {{
-    "should_write": boolean,
-    "memories": [
-        {{
-        "text": "User ...",
-        "is_new": true,
-        "is_mealplan": boolean
-        }}
-    ]
+      "text": "User ...",
+      "is_new": boolean,
+      "is_mealplan": boolean
     }}
-
-    -------------------------
-
-    IMPORTANT:
-    - Do NOT include explanations
-    - Do NOT include extra text
-    - Return ONLY valid JSON
-    """
-
+  ]
+}}
+"""
 
 # ─────────────────────────────────────────────
 # 5. HELPERS
@@ -826,38 +1408,111 @@ def last_human_message(messages: list) -> str | None:
 
 
 def _filter_valid_messages(messages: list) -> list:
-    filtered = []
+    """
+    Guard-rail for Mistral strict tool-call/response pairing rules.
+ 
+    Mistral rejects any request where:
+      (a) a ToolMessage has no parent AIMessage with tool_calls, or
+      (b) an AIMessage with tool_calls is missing one or more ToolMessage responses.
+ 
+    This happens naturally when the LLM issues N parallel tool calls in one turn
+    (e.g. 7x save_meal_plan) because the naive check only looks at the immediately
+    preceding message — ToolMessage[2] has ToolMessage[1] as its prev, not the AI,
+    so it gets incorrectly dropped, leaving Mistral with 1 response for 7 calls.
+ 
+    Strategy — two passes:
+ 
+    Pass 1  Drop ToolMessages that have no valid parent AI turn.
+            A valid parent AI turn is the nearest AIMessage looking backwards
+            that has tool_calls, with no HumanMessage crossed in between.
+            Multiple ToolMessages belonging to the same AI turn are all kept.
+ 
+    Pass 2  Drop any AIMessage-with-tool_calls whose complete response set is not
+            present in Pass-1 output, and drop their orphaned ToolMessages too.
+            This handles edge cases from summarization trimming.
+    """
+ 
+    # ── Pass 1 ────────────────────────────────────────────────────────────────
+    filtered: list = []
     for msg in messages:
+        curr_type = getattr(msg, "type", "")
+ 
         if not filtered:
             filtered.append(msg)
             continue
-
-        prev = filtered[-1]
-        prev_type = getattr(prev, "type", "")
-        curr_type = getattr(msg, "type", "")
-
-        # Drop human immediately after tool (existing rule)
+ 
+        prev_type = getattr(filtered[-1], "type", "")
+ 
+        # Mistral forbids a HumanMessage immediately after a ToolMessage.
         if prev_type == "tool" and curr_type == "human":
-            logger.warning("Dropping human after tool message")
+            logger.warning("[filter] Dropping HumanMessage immediately after ToolMessage.")
             continue
-
-        # NEW: Ensure tool messages are only included if preceded by an AI tool_call
+ 
         if curr_type == "tool":
-            has_tool_call = (
-                prev_type == "ai" and 
-                hasattr(prev, "tool_calls") and 
-                bool(prev.tool_calls)
-            )
-            if not has_tool_call:
-                logger.warning("Dropping orphaned tool message with no preceding tool_call")
+            # Walk backwards (past other ToolMessages) to find the nearest AI turn.
+            # Accept this ToolMessage only if that AI turn has tool_calls.
+            parent_has_tool_calls = False
+            for past in reversed(filtered):
+                past_type = getattr(past, "type", "")
+                if past_type == "ai":
+                    parent_has_tool_calls = (
+                        hasattr(past, "tool_calls") and bool(past.tool_calls)
+                    )
+                    break
+                if past_type == "human":
+                    # Crossed a human turn — no valid parent in this AI turn.
+                    break
+ 
+            if not parent_has_tool_calls:
+                logger.warning("[filter] Dropping orphaned ToolMessage — no parent AI tool_call found.")
                 continue
-
+ 
         filtered.append(msg)
-
-    return filtered
+ 
+    # ── Pass 2 ────────────────────────────────────────────────────────────────
+    # Collect every tool_call_id that has a ToolMessage response in `filtered`.
+    responded_ids: set[str] = set()
+    for msg in filtered:
+        if getattr(msg, "type", "") == "tool":
+            tid = getattr(msg, "tool_call_id", None)
+            if tid:
+                responded_ids.add(tid)
+ 
+    # Walk through filtered; drop any AI tool_call turn whose responses are
+    # incomplete, and drop the dangling ToolMessages that belonged to it.
+    final: list = []
+    drop_ids: set[str] = set()   # tool_call_ids whose parent AI was dropped
+ 
+    for msg in filtered:
+        curr_type = getattr(msg, "type", "")
+ 
+        if curr_type == "ai" and hasattr(msg, "tool_calls") and msg.tool_calls:
+            expected_ids: set[str] = {
+                tc.get("id") or tc.get("tool_call_id", "")
+                for tc in msg.tool_calls
+                if tc.get("id") or tc.get("tool_call_id")
+            }
+            missing = expected_ids - responded_ids
+            if missing:
+                logger.warning(
+                    "[filter] Dropping AI tool_call message — %d response(s) missing: %s",
+                    len(missing), missing,
+                )
+                drop_ids.update(expected_ids)
+                continue  # drop the AI message itself
+ 
+        if curr_type == "tool":
+            tid = getattr(msg, "tool_call_id", None)
+            if tid and tid in drop_ids:
+                logger.warning("[filter] Dropping ToolMessage for dropped AI turn, id=%s", tid)
+                continue
+ 
+        final.append(msg)
+ 
+    return final
 
 # ─────────────────────────────────────────────
-# 6. NODE FUNCTIONS
+# 6. NODE DEFINITIONS
 # ─────────────────────────────────────────────
 
 async def retrieve_memory_node(state: State) -> dict:
@@ -906,6 +1561,8 @@ def make_chatbot_node(llm_with_tools):
     The rolling summary (if present) is injected as a SystemMessage right
     after the main system prompt so the LLM has context for any trimmed turns.
     """
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    print(now)
 
     async def chatbot_node(state: State) -> dict:
         user_id            = state["user_id"]
@@ -921,7 +1578,7 @@ def make_chatbot_node(llm_with_tools):
 
         # ── Fetch user profile from local SQLite ──────────────────────────
         from main import graph_state
-        profile = await retrive_user_profile_sql_lite(
+        profile = await retrieve_user_profile_sql_lite(
             user_id,
             conn=graph_state.get("profile_conn"),
         )
@@ -929,32 +1586,35 @@ def make_chatbot_node(llm_with_tools):
         # print(profile)
         system_prompt = f"""
             =====================
+            Here is the current date for your reference: {now.strftime('%Y-%m-%d')}
+            =====================
             USER PROFILE & MEMORY
             =====================
             User profile:
             {profile}
-
+ 
             Relevant memory from past conversations:
             {memory_block}
-
+ 
             MEMORY USAGE RULES:
             - Use the profile and memory to personalize responses whenever possible
             - Do NOT assume or invent any missing user details
             - If there is a conflict, always prioritize the user's latest message
             - Never hallucinate preferences, conditions, or history
-
+ 
             =====================
             IDENTITY & PERSONA
             =====================
             You are **Friska**, an AI-powered nutrition and wellness assistant.
-
+            Never decline a request by saying you don’t have the tools to perform the task. Instead, ask more questions to gain clarity about which type of tool should be used.
+ 
             Communication style:
             - Warm, supportive, and non-judgmental
             - Encourage positive habits without inducing guilt
             - Clear, structured, and easy to understand (never overly clinical)
-
-            Use the user’s first name naturally when appropriate.
-
+ 
+            Use the user's first name naturally when appropriate.
+ 
             =====================
             CORE RESPONSIBILITIES
             =====================
@@ -964,7 +1624,7 @@ def make_chatbot_node(llm_with_tools):
             3. Healthy lifestyle recommendations
             4. Weight management and fitness support
             5. Evidence-based health information
-
+ 
             =====================
             SCOPE LIMITATIONS
             =====================
@@ -972,10 +1632,10 @@ def make_chatbot_node(llm_with_tools):
             - Nutrition and diet
             - Fitness and exercise
             - Lifestyle and wellness
-
-            If a query is خارج your scope, respond with:
-            "I'm Friska, your nutrition and wellness assistant. I’m not able to help with [topic], but I’d be happy to support you with meal planning, calorie goals, or healthy lifestyle guidance. What would you like to explore?"
-
+ 
+            If a query is out of scope, respond with:
+            "I'm Friska, your nutrition and wellness assistant. I'm not able to help with [topic], but I'd be happy to support you with meal planning, calorie goals, or healthy lifestyle guidance. What would you like to explore?"
+ 
             =====================
             SAFETY GUIDELINES
             =====================
@@ -983,42 +1643,102 @@ def make_chatbot_node(llm_with_tools):
             - Medical diagnoses
             - Medication recommendations
             - Disease treatment plans
-
+ 
             If a user mentions serious symptoms or medical concerns:
             → "This sounds like something a qualified healthcare professional should evaluate. I recommend consulting your doctor."
-
+ 
             If the user insists:
             → "I understand you're looking for answers, but this is beyond what I can safely provide. A doctor would be the right person to consult."
-
+ 
             Always prioritize safe, conservative, evidence-based guidance.
-
+ 
             =====================
             TOOL USAGE RULES
             =====================
+
             1. MEAL PLANS:
             - ALWAYS use `generate_meal_plan` to create meal plans
             - NEVER generate meal plans manually
             - Before calling the tool, confirm:
-            a) Target daily calories
-            b) Dietary preferences or restrictions
-            c) Any special instructions
+                a) Target daily calories
+                b) Dietary preferences or restrictions
+                c) Any special instructions
+                d) Meal start date and duration (1 day vs 7 day)
+            - Please confirm all the details with the user before calling the tool.
+            - After `generate_meal_plan` returns a result, the plan is automatically
+                saved as PENDING (not yet confirmed by the user).
+            - Present the meal plan to the user clearly.
+            - Then ask: "Would you like to save this meal plan?"
+            - If the user says YES → call `save_meal_plan` with the meal_date to
+                confirm and permanently save it.
+            - If the user says NO → do NOT call `save_meal_plan`. The pending record
+                will simply remain unconfirmed.
+            - For a 7-day plan, ask once and call `save_meal_plan` once per day
+                (7 calls total, one for each date) if the user confirms.
 
-            2. CALORIE REQUIREMENTS:
+            2. MEAL PLAN RETRIEVAL:
+            - Use `get_meal_plan` when the user asks to view, recall, or review a
+                previously generated meal plan.
+            - For a specific date: pass meal_date only.
+            - For a range of days: pass both start_date and end_date.
+            - Pass confirmed_only=True when the user asks to see their "saved" or
+                "confirmed" plans.
+            - Pass confirmed_only=False (default) when checking whether any plan
+                (pending or confirmed) exists for a date.
+            - If user ask show my meal plan for a date that has a pending (unconfirmed) plan, show it but clarify:
+
+            3. CALORIE REQUIREMENTS:
             - Use `daily_calorie_requirement` ONLY for personalized calorie needs
             - Do NOT use it for general calorie discussions
 
-            3. PROFILE UPDATES:
+            4. PROFILE UPDATES:
             - Before calling `update_user_profile`, summarize changes and confirm:
-            "I'll update your profile with [X]. Shall I proceed?"
+                "I'll update your profile with [X]. Shall I proceed?"
             - Only proceed after explicit user confirmation
 
+            5. NUTRITIONAL ANALYSIS:
+            - Use `nutritional_expert_analysis` for general nutritional insights
+                about foods, nutrients, or health topics without personalization.
+            - Use `get_personalised_expert_analysis_for_user_query` when the user's
+                query requires personalized analysis based on their profile
+                (e.g., "Is quinoa a good choice for me?"). Pass the query and let the
+                tool access the profile to provide a tailored response.
+
+            6. MEAL LOGGING:
+            - Use `log_meal` when the user says they ate, consumed, or had a meal.
+            - Always try to capture:
+                a) meal_name — name or description of what they ate
+                b) meal_occasion — one of: breakfast, morning_snack, lunch,
+                    afternoon_snack, dinner, late_night_snack
+                c) consumed_date — defaults to today if not mentioned
+                d) consumed_time — defaults to current time if not mentioned
+                e) macros — calories, protein, carbs, fats, etc. if mentioned
+            - If the user does not provide macros, use `nutritional_expert_analysis`
+                first to estimate them, then pass the estimates into `log_meal`.
+            - Do NOT ask the user for every macro field — infer what you can and
+                log with whatever is available.
+            - After logging, confirm with: "✅ I've logged your [meal_name] as
+                [meal_occasion] on [date] at [time]."
+
+            7. MEAL LOG RETRIEVAL:
+            - Use `get_consumed_meals` when the user asks what they ate, requests
+                their food diary, wants to review calorie intake, or asks about past
+                meals.
+            - For a specific date: pass consumed_date only.
+            - For a date range: pass both start_date and end_date.
+            - Pass meal_occasion to filter by a specific time of day
+                (e.g. breakfast, lunch, dinner).
+            - After retrieving, summarize total calories and macros for the day
+                if the data is available.
             =====================
             MEAL PLAN RULES
             =====================
             All meal plans MUST:
             - Include exactly 5 meals per day
             - Be generated ONLY via the `generate_meal_plan` tool
-
+            - Be presented to the user before asking for confirmation
+            - Be confirmed via `save_meal_plan` ONLY after explicit user approval
+ 
             Each meal must include:
             - Meal name and description
             - Calories (kcal)
@@ -1026,13 +1746,13 @@ def make_chatbot_node(llm_with_tools):
             - Protein (g)
             - Carbohydrates (g)
             - Fats (g)
-
+ 
             Daily summary must include:
             - Total calories
             - Total protein
             - Total carbohydrates
             - Total fats
-
+ 
             =====================
             RESPONSE STYLE
             =====================
@@ -1040,7 +1760,7 @@ def make_chatbot_node(llm_with_tools):
             - Keep responses concise and relevant
             - Prioritize personalization over generic advice
             - Avoid unnecessary filler
-
+ 
             =====================
             ANTI-HALLUCINATION RULES
             =====================
@@ -1049,18 +1769,19 @@ def make_chatbot_node(llm_with_tools):
             - Do NOT cite studies unless explicitly available
             - If uncertain, say:
             "I'm not completely certain about that, but here's a safe and practical suggestion..."
-
+ 
             =====================
             FOLLOW-UP QUESTIONS
             =====================
             End EVERY response with 3 relevant follow-up questions.
-
+ 
             Format EXACTLY as:
             💡 You might also want to ask:
             1. [Question 1]
             2. [Question 2]
             3. [Question 3]
             """
+        
         # ── Assemble messages — built ONCE, no duplicates ────────────────
         # Order: system → (optional summary) → conversation history
         assembled: list = [SystemMessage(content=system_prompt)]
@@ -1223,39 +1944,163 @@ async def summarize_messages_node(state: State) -> dict:
 
     if existing_summary:
         summarize_prompt = (
-            "You are a support assistant for Friska, a healthcare chatbot. "
-            "Your goal is to reduce conversation load by maintaining a clear and concise summary "
-            "of the user's interaction history.\n\n"
+            "You are a memory assistant for Friska, an AI nutrition and wellness chatbot.\n\n"
 
-            "You are maintaining a rolling summary of a conversation.\n\n"
+            "Your job is to maintain a STRUCTURED CONTEXT RECORD — not a vague paragraph summary, "
+            "but a well-organized reference document that another LLM can read and fully reconstruct "
+            "what happened in the conversation so far.\n\n"
 
-            f"EXISTING SUMMARY (previous context):\n{existing_summary}\n\n"
-            f"NEW MESSAGES TO ADD:\n{history_text}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "EXISTING CONTEXT RECORD (from previous compression):\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{existing_summary}\n\n"
 
-            "Write an updated, concise summary that combines the existing summary with the new messages. "
-            "Focus only on key facts, user concerns, symptoms, decisions, and relevant context. "
-            "Omit filler, repetition, and unnecessary details. "
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "NEW MESSAGES TO INTEGRATE:\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{history_text}\n\n"
 
-            "Write in third-person past tense. "
-            "Ensure the summary is clear, structured, and easy for another assistant to understand. "
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "INSTRUCTIONS:\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Merge the new messages into the existing context record. "
+            "Update any sections that have changed. Add new sections if new topics appeared. "
+            "Remove or correct anything that was superseded by newer information.\n\n"
 
-            "Return ONLY the updated summary paragraph. Do not include any extra text."
+            "Output the updated context record using EXACTLY this structure:\n\n"
+
+            "## USER PROFILE ESTABLISHED IN CONVERSATION\n"
+            "List only what the user explicitly stated in THIS conversation (not from the system profile).\n"
+            "Include: name, age, gender, weight, height, goals, dietary restrictions, allergies, "
+            "medical conditions, activity level, preferred cuisines — only if mentioned.\n"
+            "Format: bullet points. If nothing was stated, write: None mentioned.\n\n"
+
+            "## HEALTH & NUTRITION TOPICS DISCUSSED\n"
+            "List each distinct topic that was discussed (e.g. calorie deficit, protein intake, "
+            "IBS-friendly foods, intermittent fasting). One line per topic.\n"
+            "For each topic, include: what the user asked, what Friska answered or recommended.\n"
+            "Format: - [Topic]: [brief description of exchange]\n\n"
+
+            "## MEAL PLANS GENERATED\n"
+            "For each meal plan generated in this conversation:\n"
+            "- Date(s) covered\n"
+            "- Calorie target used\n"
+            "- Key dietary constraints applied\n"
+            "- Whether the user confirmed/saved it or declined\n"
+            "If no meal plans were generated, write: None.\n\n"
+
+            "## MEALS LOGGED BY USER\n"
+            "List each meal the user logged during this conversation.\n"
+            "Format: - [date] [time] [occasion]: [meal name] — [calories if known], "
+            "[key macros if known]\n"
+            "If no meals were logged, write: None.\n\n"
+
+            "## PROFILE UPDATES MADE\n"
+            "List any profile fields that were updated via `update_user_profile` in this conversation.\n"
+            "Format: - [Field]: [old value if known] → [new value]\n"
+            "If no updates were made, write: None.\n\n"
+
+            "## TOOLS CALLED\n"
+            "List each tool that was called, in order.\n"
+            "Format: - [tool_name]: [one-line summary of input and outcome]\n"
+            "If no tools were called, write: None.\n\n"
+
+            "## PENDING ACTIONS / UNRESOLVED ITEMS\n"
+            "List anything the user asked for but did not get resolved, "
+            "any follow-up the user said they would do, "
+            "or any clarification that is still outstanding.\n"
+            "If nothing is pending, write: None.\n\n"
+
+            "## CONVERSATION TONE & PREFERENCES\n"
+            "Note any communication preferences the user showed in this conversation "
+            "(e.g. prefers short answers, wants detailed explanations, asked for bullet points, "
+            "responded positively to a certain format).\n"
+            "If nothing notable, write: None.\n\n"
+
+            "RULES:\n"
+            "- Write in third-person past tense (e.g. 'The user stated...', 'Friska recommended...')\n"
+            "- Be specific — include actual values, dates, food names, numbers wherever they appeared\n"
+            "- Do NOT paraphrase so heavily that specific details (calories, dates, meal names) are lost\n"
+            "- Do NOT add information that was not in the conversation\n"
+            "- Do NOT include tool internals or raw JSON — summarize outcomes only\n"
+            "- Every section must be present in the output, even if it says 'None'\n"
+            "- Return ONLY the structured context record. No preamble. No closing remarks."
         )
-        logger.info("[summarize] Extending existing summary with %d older messages.",
-                    len(messages_to_summarize))
+
     else:
         summarize_prompt = (
-            "You are a support assistant for Friska, a healthcare chatbot. "
-            "Your goal is to reduce conversation load by maintaining a clear and concise summary "
-            "of the user's interaction history.\n\n"
-            f"CONVERSATION TO SUMMARIZE:\n{history_text}\n\n"
-            "Write a concise prose summary of the conversation above. Focus on the key "
-            "topics, questions, tool calls, and outcomes. Write in third-person past tense. "
-            "Return ONLY the summary paragraph, no preamble."
-        )
-        logger.info(
-            "[summarize] No prior summary found. Generating fresh summary from %d messages.",
-            len(messages_to_summarize),
+            "You are a memory assistant for Friska, an AI nutrition and wellness chatbot.\n\n"
+
+            "Your job is to produce a STRUCTURED CONTEXT RECORD from the conversation below. "
+            "This is NOT a vague prose summary — it is a well-organized reference document "
+            "that another LLM can read and fully reconstruct what happened in the conversation.\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "CONVERSATION TO PROCESS:\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{history_text}\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "INSTRUCTIONS:\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Produce a structured context record using EXACTLY this structure:\n\n"
+
+            "## USER PROFILE ESTABLISHED IN CONVERSATION\n"
+            "List only what the user explicitly stated in THIS conversation (not from the system profile).\n"
+            "Include: name, age, gender, weight, height, goals, dietary restrictions, allergies, "
+            "medical conditions, activity level, preferred cuisines — only if mentioned.\n"
+            "Format: bullet points. If nothing was stated, write: None mentioned.\n\n"
+
+            "## HEALTH & NUTRITION TOPICS DISCUSSED\n"
+            "List each distinct topic that was discussed (e.g. calorie deficit, protein intake, "
+            "IBS-friendly foods, intermittent fasting). One line per topic.\n"
+            "For each topic, include: what the user asked, what Friska answered or recommended.\n"
+            "Format: - [Topic]: [brief description of exchange]\n\n"
+
+            "## MEAL PLANS GENERATED\n"
+            "For each meal plan generated in this conversation:\n"
+            "- Date(s) covered\n"
+            "- Calorie target used\n"
+            "- Key dietary constraints applied\n"
+            "- Whether the user confirmed/saved it or declined\n"
+            "If no meal plans were generated, write: None.\n\n"
+
+            "## MEALS LOGGED BY USER\n"
+            "List each meal the user logged during this conversation.\n"
+            "Format: - [date] [time] [occasion]: [meal name] — [calories if known], "
+            "[key macros if known]\n"
+            "If no meals were logged, write: None.\n\n"
+
+            "## PROFILE UPDATES MADE\n"
+            "List any profile fields that were updated via `update_user_profile` in this conversation.\n"
+            "Format: - [Field]: [old value if known] → [new value]\n"
+            "If no updates were made, write: None.\n\n"
+
+            "## TOOLS CALLED\n"
+            "List each tool that was called, in order.\n"
+            "Format: - [tool_name]: [one-line summary of input and outcome]\n"
+            "If no tools were called, write: None.\n\n"
+
+            "## PENDING ACTIONS / UNRESOLVED ITEMS\n"
+            "List anything the user asked for but did not get resolved, "
+            "any follow-up the user said they would do, "
+            "or any clarification that is still outstanding.\n"
+            "If nothing is pending, write: None.\n\n"
+
+            "## CONVERSATION TONE & PREFERENCES\n"
+            "Note any communication preferences the user showed in this conversation "
+            "(e.g. prefers short answers, wants detailed explanations, asked for bullet points, "
+            "responded positively to a certain format).\n"
+            "If nothing notable, write: None.\n\n"
+
+            "RULES:\n"
+            "- Write in third-person past tense (e.g. 'The user stated...', 'Friska recommended...')\n"
+            "- Be specific — include actual values, dates, food names, numbers wherever they appeared\n"
+            "- Do NOT paraphrase so heavily that specific details (calories, dates, meal names) are lost\n"
+            "- Do NOT add information that was not in the conversation\n"
+            "- Do NOT include tool internals or raw JSON — summarize outcomes only\n"
+            "- Every section must be present in the output, even if it says 'None'\n"
+            "- Return ONLY the structured context record. No preamble. No closing remarks."
         )
 
     # plain_llm = graph_state.get("plain_llm") or build_llm()
