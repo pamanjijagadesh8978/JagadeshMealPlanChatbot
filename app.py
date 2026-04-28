@@ -41,6 +41,7 @@ import streamlit as st
 # ─────────────────────────────────────────────
 
 API_URL          = "http://localhost:8000"
+# API_URL = "https://jagadeshmealplanchatbot-768208692465.europe-west1.run.app"
 CREDENTIALS_FILE = Path(os.getenv("CREDENTIALS_FILE", "credentials.json"))
 
 st.set_page_config(
@@ -96,6 +97,23 @@ def _save_credentials(store: dict) -> bool:
         return False
 
 
+def api_register(api_token: str) -> tuple[bool, str]:
+    try:
+        r = requests.post(
+            f"{API_URL}/register",
+            json={"api_token": api_token},
+            timeout=20,
+        )
+
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("success", False), data.get("message", "")
+        else:
+            return False, r.json().get("message", "Registration failed.")
+
+    except requests.exceptions.ConnectionError:
+        return False, "Cannot reach backend."
+    
 def _register_local_user(
     username: str,
     password: str,
@@ -455,7 +473,8 @@ def render_auth_page() -> None:
             else:
                 # ── Verify token with FastAPI / identity service ──
                 with st.spinner("Verifying token with identity service…"):
-                    ok, msg = api_login(api_token.strip())
+                    with st.spinner("Creating your profile…"):
+                        ok, msg = api_register(api_token.strip())
 
                 if not ok:
                     st.error(f"Token rejected by the server: {msg}")
