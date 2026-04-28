@@ -7,7 +7,7 @@ import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -18,7 +18,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel
 
 from graph import TOOLS, build_graph, build_llm
-from utils import get_user_id_sql_server  # must exist in utils.py
+from utils import clean_profile, get_user_id_sql_server, fetch_user_id_sql_lite, get_user_profile  # must exist in utils.py
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,8 @@ USERS_DB        = "users.db"
 CHAT_DB         = "chat_history.db"
 MEMORY_DB       = "memory.db"
 PROFILE_DB      = "profiles.db"
+MEAL_PLANS_DB   = "meal_plans.db"
+CONSUMED_MEALS_DB = "consumed_meals.db"
 
 # ─────────────────────────────────────────────
 # SHARED LOCKS (imported by graph.py)
@@ -50,7 +52,8 @@ PROFILE_DB      = "profiles.db"
 users_db_lock  = asyncio.Lock()
 memory_db_lock = asyncio.Lock()
 profile_db_lock = asyncio.Lock()
-
+meal_plans_db_lock = asyncio.Lock()
+consumed_meals_db_lock = asyncio.Lock()
 # ─────────────────────────────────────────────
 # GRAPH STATE (module-level dict, populated in lifespan)
 # ─────────────────────────────────────────────
@@ -84,11 +87,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     users_conn  = await aiosqlite.connect(USERS_DB)
     memory_conn = await aiosqlite.connect(MEMORY_DB)
     profile_conn = await aiosqlite.connect(PROFILE_DB)
+    meal_plans_conn = await aiosqlite.connect(MEAL_PLANS_DB)
+    consumed_meals_conn = await aiosqlite.connect(CONSUMED_MEALS_DB)
 
-    for conn in (users_conn, memory_conn):
+    for conn in (users_conn, memory_conn, profile_conn, meal_plans_conn, consumed_meals_conn):
         await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA synchronous=NORMAL;")
-        await profile_conn.execute("PRAGMA foreign_keys = ON;")
+    
+    await profile_conn.execute("PRAGMA foreign_keys = ON;")
+    await meal_plans_conn.execute("PRAGMA foreign_keys = ON;")
+    await consumed_meals_conn.execute("PRAGMA foreign_keys = ON;")
 
     # ── Populate graph_state BEFORE calling helpers that read from it ────
     graph_state.update({
@@ -99,6 +107,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         "users_conn":   users_conn,
         "memory_conn":  memory_conn,
         "profile_conn": profile_conn,
+        "meal_plans_conn": meal_plans_conn,
+        "consumed_meals_conn": consumed_meals_conn,
     })
 
     await _init_users_db()
@@ -109,6 +119,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # ── Teardown ─────────────────────────────────────────────────────────
     await users_conn.close()
     await memory_conn.close()
+    await profile_conn.close()
+    await meal_plans_conn.close()
+    await consumed_meals_conn.close()
     await cm.__aexit__(None, None, None)
 
 
@@ -155,7 +168,9 @@ async def _init_users_db() -> None:
     users_conn  = graph_state["users_conn"]
     memory_conn = graph_state["memory_conn"]
     profile_conn = graph_state["profile_conn"]
-
+    meal_plans_conn = graph_state["meal_plans_conn"]
+    consumed_meals_conn = graph_state["consumed_meals_conn"]
+    
     async with users_db_lock:
         await users_conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -226,6 +241,53 @@ async def _init_users_db() -> None:
         """)
 
     await profile_conn.commit()
+
+    async with meal_plans_db_lock:
+        await meal_plans_conn.execute("""
+            CREATE TABLE IF NOT EXISTS meal_plans (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT    NOT NULL,
+                meal_date  TEXT    NOT NULL,
+                meal_plan  TEXT    NOT NULL,
+                is_confirmed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT    NOT NULL,
+                updated_at TEXT    NOT NULL,
+                UNIQUE(user_id, meal_date)
+            )
+        """)
+        await meal_plans_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_meal_plans_user_date
+            ON meal_plans (user_id, meal_date)
+        """)
+        await meal_plans_conn.commit()
+
+    async with consumed_meals_db_lock:
+        await consumed_meals_conn.execute("""
+            CREATE TABLE IF NOT EXISTS consumed_meals (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id           TEXT    NOT NULL,
+                meal_name         TEXT    NOT NULL,
+                meal_type         TEXT    NOT NULL,
+                consumed_date     TEXT    NOT NULL,
+                consumed_time     TEXT    NOT NULL,
+                meal_occasion     TEXT    NOT NULL,
+                calories          REAL,
+                protein_g         REAL,
+                carbohydrates_g   REAL,
+                fats_g            REAL,
+                fiber_g           REAL,
+                sugar_g           REAL,
+                sodium_mg         REAL,
+                notes             TEXT,
+                created_at        TEXT    NOT NULL,
+                updated_at        TEXT    NOT NULL
+            )
+        """)
+        await consumed_meals_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_consumed_meals_user_date
+            ON consumed_meals (user_id, consumed_date)
+        """)
+        await consumed_meals_conn.commit()
 
 
 async def _get_user_by_token(api_token: str) -> dict | None:
@@ -382,10 +444,89 @@ class HistoryResponse(BaseModel):
     title:      str
     messages:   list[MessageItem]
 
+class RegisterRequest(BaseModel):
+    api_token: str
+
+class RegisterResponse(BaseModel):
+    success: bool
+    message: Optional[str] = None
+
 
 # ─────────────────────────────────────────────
 # AUTH ROUTES
 # ─────────────────────────────────────────────
+
+@app.post("/register", response_model=RegisterResponse)
+async def register_user(body: RegisterRequest):
+    api_token = body.api_token.strip()
+
+    if not api_token:
+        return RegisterResponse(success=False, message="API token is required.")
+
+    try:
+        # Verify token with external identity service
+        conn = graph_state.get("users_conn")
+        user_id = await fetch_user_id_sql_lite(api_token, conn)
+        if user_id:
+            logger.info("register_user: user_id=%s found in local SQLite for api_token=%s", user_id, api_token)
+            return RegisterResponse(success=True, message="User already registered.")
+        if not user_id:
+            user_id = await get_user_id_sql_server(api_token)
+
+        if not user_id:
+            return RegisterResponse(success=False, message="Invalid API token.")
+
+        # Insert user into DB (or update if exists)
+        profile = await get_user_profile("FriskaAiCCM_HFWL", user_id)
+        print(f"Profile: {profile}")
+        if not profile:
+            return RegisterResponse(success=False, message="Error: profile not found")
+
+        logger.info("get_profile: profile fetched for user_id=%s", user_id)
+
+        # ── Clean and persist to local SQLite ────────────────────────────────
+        cleaned = clean_profile(profile, user_id)  # must return keys below
+        conn_profile = graph_state.get("profile_conn")
+        if conn_profile is None:
+            return RegisterResponse(success=False, message="Error: Database connection not available.")
+        await conn_profile.execute(
+            """
+            INSERT OR REPLACE INTO UserHealthProfile (
+                user_id,
+                Name, Age, Gender,
+                WeightKG, HeightCM, WaistCircumferenceCM,
+                Cuisine, ActivityLevel, Calories,
+                DietaryPreference, Restrictions, DigestiveIssues,
+                Allergies, SymptomAggravatingFoods,
+                HeartRate, BloodPressure, BodyTemperature,
+                BloodOxygen, RespiratoryRate,
+                MedicalConditions, Goals,
+                ModifiedDate
+            ) VALUES (
+                :user_id,
+                :name, :age, :gender,
+                :weight_kg, :height_cm, :waist_circumference_cm,
+                :cuisine, :activity_level, :calories,
+                :dietary_preference, :restrictions, :digestive_issues,
+                :allergies, :symptom_aggravating_foods,
+                :heart_rate, :blood_pressure, :body_temperature,
+                :blood_oxygen, :respiratory_rate,
+                :medical_conditions, :goals,
+                datetime('now')
+            )
+            """,
+            cleaned,
+        )
+        await conn_profile.commit()
+        logger.info("get_profile: profile for user_id=%s saved to local SQLite.", user_id)
+        logger.info("Profile Type: %s, Profile: %s", type(profile), profile)
+
+        return RegisterResponse(success=True)
+
+    except Exception as exc:
+        logger.exception("Registration failed: %s", exc)
+        return RegisterResponse(success=False)
+
 
 @app.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest):
@@ -399,7 +540,10 @@ async def login(body: LoginRequest):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "api_token is required.")
 
     try:
-        user_id = await get_user_id_sql_server(api_token)
+        conn = graph_state.get("users_conn")
+        user_id = await fetch_user_id_sql_lite(api_token, conn)
+        if not user_id:
+            user_id = await get_user_id_sql_server(api_token)
     except HTTPException:
         raise
     except Exception as exc:
