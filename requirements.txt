@@ -7,6 +7,7 @@ langchain-core
 langchain-mistralai
 langchain-openai
 langgraph
+langgraph-checkpoint-sqlite   # ← ADD THIS
 
 # LLM providers
 mistralai
