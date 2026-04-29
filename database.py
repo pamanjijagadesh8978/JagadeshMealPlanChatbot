@@ -5,6 +5,7 @@ import asyncio
 SERVER = os.getenv("SERVER")
 DYNAMIC_USERNAME = os.getenv("DYNAMIC_USERNAME")
 DYNAMIC_PASSWORD = os.getenv("DYNAMIC_PASSWORD")
+DYNAMIC_DB_NAME = os.getenv("DYNAMIC_DB_NAME")
 MASTER_TABLE_DB_NAME = os.getenv("MASTER_TABLE_DB_NAME")
 
 def create_connection(database_name: str):
